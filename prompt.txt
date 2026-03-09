@@ -1,0 +1,83 @@
+You are a senior software architect and full-stack developer.
+
+Help me design and build a complete store inventory management system. I want you to design the architecture first before writing any code.
+
+The system should track all inventory in a retail store and allow employees to scan, update, and manage stock in real time.
+
+Requirements:
+
+Users
+• Store employees
+• Store managers
+• System administrators
+
+Core Features
+• Barcode scanning to identify products
+• Add new products to inventory
+• Track quantity on hand
+• Track product location (aisle, shelf, bin)
+• Track cost and retail price
+• Track suppliers
+• Track purchase orders
+• Track sales deductions
+• Automatic low-stock alerts
+• Inventory audit / cycle counts
+• History of inventory changes
+• Multi-user support
+
+Advanced Features
+• Mobile friendly interface for phones
+• Offline mode with sync
+• AI product recognition using camera
+• Predictive restocking suggestions
+• Automatic reorder generation
+• Sales analytics dashboard
+• Integration with POS systems
+• Integration with barcode scanners
+• CSV / Excel import and export
+• Role-based permissions
+• Image storage for products
+
+Inventory Operations
+• Stock in
+• Stock out
+• Transfer between locations
+• Adjustments
+• Returns
+• Damaged items tracking
+
+Search and Filtering
+• Search by name
+• Search by SKU
+• Search by barcode
+• Filter by category
+• Filter by supplier
+• Filter by stock level
+
+Data Model
+Design a database schema for:
+• Products
+• Inventory levels
+• Locations
+• Suppliers
+• Orders
+• Transactions
+• Users
+• Audit logs
+
+Technology
+Choose a modern stack that is easy to maintain.
+
+Preferred:
+Frontend: React
+Backend: Node.js
+Database: PostgreSQL or Firebase
+Optional mobile app support.
+
+Output format
+1. System architecture
+2. Database schema
+3. API endpoints
+4. UI screens
+5. Step-by-step build plan
+6. Code examples

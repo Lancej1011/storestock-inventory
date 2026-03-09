@@ -1,0 +1,34 @@
+[build]
+  command = "npm run build"
+  publish = "dist"
+  environment = { NODE_VERSION = "20" }
+
+# SPA redirect - all routes go to index.html
+[[redirects]]
+  from = "/*"
+  to = "/index.html"
+  status = 200
+
+# API proxy - forward /api requests to Railway backend
+# Replace YOUR-RAILWAY-SUBDOMAIN with your actual Railway subdomain
+[[redirects]]
+  from = "/api/*"
+  to = "https://your-app-name.railway.app/api/:splat"
+  status = 200
+  force = true
+
+# Socket.io proxy for real-time updates
+[[redirects]]
+  from = "/socket.io/*"
+  to = "https://your-app-name.railway.app/socket.io/:splat"
+  status = 200
+  force = true
+
+[context.production.environment]
+  VITE_API_URL = "/api"
+
+[context.deploy-preview.environment]
+  VITE_API_URL = "/api"
+
+[context.branch-deploy.environment]
+  VITE_API_URL = "/api"

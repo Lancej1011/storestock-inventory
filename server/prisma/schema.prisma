@@ -1,0 +1,291 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ============== ENUMS ==============
+
+enum UserRole {
+  ADMIN
+  MANAGER
+  EMPLOYEE
+  VIEWER
+}
+
+enum OrderStatus {
+  DRAFT
+  PENDING
+  ORDERED
+  RECEIVED
+  CANCELLED
+}
+
+enum TransactionType {
+  STOCK_IN
+  STOCK_OUT
+  TRANSFER
+  ADJUSTMENT
+  RETURN
+  DAMAGED
+}
+
+// ============== MODELS ==============
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  fullName     String   @map("full_name")
+  role         UserRole @default(EMPLOYEE)
+  storeId      String?  @map("store_id")
+  store        Store?   @relation(fields: [storeId], references: [id])
+  isActive     Boolean  @default(true) @map("is_active")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  // Relations
+  stockTransactions StockTransaction[]
+  auditLogs         AuditLog[]
+  purchaseOrders    PurchaseOrder[]
+
+  @@map("users")
+}
+
+model Store {
+  id        String   @id @default(uuid())
+  name      String
+  address   String?
+  phone     String?
+  email     String?
+  isActive  Boolean  @default(true) @map("is_active")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  // Relations
+  users             User[]
+  locations         Location[]
+  inventory         Inventory[]
+  purchaseOrders    PurchaseOrder[]
+  stockTransactions StockTransaction[]
+
+  @@map("stores")
+}
+
+model Location {
+  id          String   @id @default(uuid())
+  storeId     String   @map("store_id")
+  store       Store    @relation(fields: [storeId], references: [id])
+  aisle       String
+  shelf      String
+  bin         String?
+  description String?
+  isActive    Boolean  @default(true) @map("is_active")
+
+  // Relations
+  inventory         Inventory[]
+  stockTransactions StockTransaction[]
+
+  @@unique([storeId, aisle, shelf, bin])
+  @@map("locations")
+}
+
+model Category {
+  id          String     @id @default(uuid())
+  name        String
+  description String?
+  parentId    String?    @map("parent_id")
+  parent      Category?  @relation("CategoryHierarchy", fields: [parentId], references: [id])
+  children    Category[] @relation("CategoryHierarchy")
+  products    Product[]
+  isActive    Boolean    @default(true) @map("is_active")
+
+  @@map("categories")
+}
+
+model Supplier {
+  id          String   @id @default(uuid())
+  name        String
+  contactName String?  @map("contact_name")
+  email       String?
+  phone       String?
+  address     String?
+  isActive    Boolean  @default(true) @map("is_active")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  // Relations
+  products       Product[]
+  purchaseOrders PurchaseOrder[]
+
+  @@map("suppliers")
+}
+
+model Product {
+  id            String    @id @default(uuid())
+  barcode       String    @unique
+  sku           String    @unique
+  name          String
+  description   String?
+  categoryId    String?   @map("category_id")
+  category      Category? @relation(fields: [categoryId], references: [id])
+  supplierId    String?   @map("supplier_id")
+  supplier      Supplier? @relation(fields: [supplierId], references: [id])
+  costPrice     Decimal   @db.Decimal(10, 2) @map("cost_price")
+  retailPrice   Decimal   @db.Decimal(10, 2) @map("retail_price")
+  reorderLevel  Int       @default(10) @map("reorder_level")
+  reorderQty    Int       @default(50) @map("reorder_qty")
+  expiryDate    DateTime? @map("expiry_date")
+  imageUrl      String?   @map("image_url")
+  isActive      Boolean   @default(true) @map("is_active")
+  version       Int       @default(0)
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  // Relations
+  images              ProductImage[]
+  variants            ProductVariant[]
+  inventory           Inventory[]
+  stockTransactions   StockTransaction[]
+  purchaseOrderItems  PurchaseOrderItem[]
+
+  @@index([barcode])
+  @@index([sku])
+  @@map("products")
+}
+
+model ProductImage {
+  id        String   @id @default(uuid())
+  productId String   @map("product_id")
+  product   Product  @relation(fields: [productId], references: [id])
+  imageUrl  String   @map("image_url")
+  isPrimary Boolean  @default(false) @map("is_primary")
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@map("product_images")
+}
+
+model ProductVariant {
+  id              String   @id @default(uuid())
+  productId       String   @map("product_id")
+  product         Product  @relation(fields: [productId], references: [id])
+  sku             String   @unique
+  name            String
+  size            String?
+  color           String?
+  barcode         String?  @unique
+  priceAdjustment Decimal  @db.Decimal(10, 2) @default(0) @map("price_adjustment")
+  isActive        Boolean  @default(true) @map("is_active")
+
+  @@map("product_variants")
+}
+
+model Inventory {
+  id               String    @id @default(uuid())
+  storeId          String    @map("store_id")
+  store            Store     @relation(fields: [storeId], references: [id])
+  productId        String    @map("product_id")
+  product          Product   @relation(fields: [productId], references: [id])
+  locationId       String?   @map("location_id")
+  location         Location? @relation(fields: [locationId], references: [id])
+  quantity         Int       @default(0)
+  reservedQty      Int       @default(0) @map("reserved_qty")
+  damagedQty       Int       @default(0) @map("damaged_qty")
+  lastCountedAt    DateTime? @map("last_counted_at")
+  updatedAt        DateTime  @updatedAt @map("updated_at")
+  version          Int       @default(0)
+  isActive         Boolean   @default(true) @map("is_active")
+
+  // Relations
+  stockTransactions StockTransaction[]
+
+  @@unique([storeId, productId, locationId])
+  @@index([storeId])
+  @@index([productId])
+  @@map("inventory")
+}
+
+model PurchaseOrder {
+  id            String      @id @default(uuid())
+  orderNumber   String      @unique @map("order_number")
+  supplierId    String      @map("supplier_id")
+  supplier      Supplier    @relation(fields: [supplierId], references: [id])
+  storeId       String      @map("store_id")
+  store         Store       @relation(fields: [storeId], references: [id])
+  status        OrderStatus @default(DRAFT)
+  totalAmount   Decimal     @db.Decimal(10, 2) @default(0) @map("total_amount")
+  expectedDate  DateTime?   @map("expected_date")
+  receivedDate  DateTime?   @map("received_date")
+  createdById   String      @map("created_by_id")
+  createdBy     User        @relation(fields: [createdById], references: [id])
+  createdAt     DateTime    @default(now()) @map("created_at")
+
+  // Relations
+  items PurchaseOrderItem[]
+
+  @@index([supplierId])
+  @@index([storeId])
+  @@map("purchase_orders")
+}
+
+model PurchaseOrderItem {
+  id                String        @id @default(uuid())
+  orderId           String        @map("order_id")
+  order             PurchaseOrder @relation(fields: [orderId], references: [id])
+  productId         String        @map("product_id")
+  product           Product       @relation(fields: [productId], references: [id])
+  quantity          Int
+  unitCost          Decimal       @db.Decimal(10, 2) @map("unit_cost")
+  receivedQuantity  Int           @default(0) @map("received_quantity")
+
+  @@map("purchase_order_items")
+}
+
+model StockTransaction {
+  id              String          @id @default(uuid())
+  productId      String          @map("product_id")
+  product         Product         @relation(fields: [productId], references: [id])
+  storeId        String          @map("store_id")
+  store           Store           @relation(fields: [storeId], references: [id])
+  locationId     String?         @map("location_id")
+  location        Location?       @relation(fields: [locationId], references: [id])
+  inventoryId    String?         @map("inventory_id")
+  inventory      Inventory?      @relation(fields: [inventoryId], references: [id])
+  userId         String          @map("user_id")
+  user            User            @relation(fields: [userId], references: [id])
+  type            TransactionType
+  quantity        Int
+  previousQty     Int             @map("previous_qty")
+  newQty         Int             @map("new_qty")
+  referenceId    String?         @map("reference_id")
+  referenceType  String?         @map("reference_type")
+  notes           String?
+  createdAt       DateTime        @default(now()) @map("created_at")
+
+  @@index([productId])
+  @@index([storeId])
+  @@index([createdAt])
+  @@map("stock_transactions")
+}
+
+model AuditLog {
+  id         String   @id @default(uuid())
+  userId     String?  @map("user_id")
+  user       User?    @relation(fields: [userId], references: [id])
+  action     String
+  entityType String   @map("entity_type")
+  entityId   String   @map("entity_id")
+  oldValues  Json?    @map("old_values")
+  newValues  Json?    @map("new_values")
+  ipAddress  String?  @map("ip_address")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@index([entityType, entityId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
