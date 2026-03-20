@@ -1,974 +1,816 @@
-import { useState, useEffect, useRef } from 'react';
-import { BrowserMultiFormatReader, NotFoundException } from '@zxing/library';
-import axios from 'axios';
-import api from '../services/api';
-import { useAuthStore } from '../store/authStore';
-import { loadModel, classifyImage } from '../utils/imageRecognition';
-import { analyzeProductLabel, matchOCRToProducts, OCRResult } from '../utils/ocr';
-import { loadShelfModel, detectProducts, DetectedObject } from '../utils/shelfScanner';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import { ScannerView } from '../components/scanner/ScannerView';
 import { ScanResults } from '../components/scanner/ScanResults';
-import { ProductForm } from '../components/scanner/ProductForm';
-import { StockUpdateForm } from '../components/scanner/StockUpdateForm';
+import {
+  detectProductsMultiModal,
+  resetTracker,
+  getTrackerStats
+} from '../utils/shelfScanner';
+import { BrowserMultiFormatReader } from '@zxing/browser';
+import { DecodeHintType, BarcodeFormat } from '@zxing/library';
+import { createWorker } from 'tesseract.js';
+import api from '../services/api';
+import { useAuthStore } from '../store/authStore';
+import { CountManager, getCountManager, resetCountManager, CountedItem } from '../utils/countManager';
+import { registerIdentifiedProduct } from '../utils/multiModalMatcher';
+import { loadEmbeddingModel } from '../utils/productFingerprint';
+import { OCRResult } from '../utils/ocr';
 
-interface Product {
+export interface ScannedProduct {
   id: string;
-  barcode: string;
+  name: string;
   sku: string;
-  name: string;
-  description?: string;
-  costPrice: string;
-  retailPrice: string;
-  category?: { id: string; name: string };
-  images?: { id: string; imageUrl: string; isPrimary: boolean }[];
-}
-
-interface ScannedItem {
-  product: Product;
-  count: number;
-}
-
-interface Inventory {
-  id: string;
-  quantity: number;
-  store: { id: string; name: string };
-  location?: { id: string; aisle: string; shelf: string };
-}
-
-interface Store {
-  id: string;
-  name: string;
-}
-
-interface Location {
-  id: string;
-  aisle: string;
-  shelf: string;
-  bin?: string;
+  barcode?: string;
+  price: number;
+  image?: string;
+  count?: number;
+  confidence?: number;
+  matchType?: 'barcode' | 'ocr' | 'visual' | 'fused';
+  notFound?: boolean;
+  isExternal?: boolean;
+  errorMessage?: string;
 }
 
 export default function Scan() {
-  const { user } = useAuthStore();
   const [scanning, setScanning] = useState(false);
-  const [result, setResult] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [loading, setLoading] = useState(false);
-  const [product, setProduct] = useState<Product | null>(null);
-  const [inventory, setInventory] = useState<Inventory | null>(null);
-  const [stores, setStores] = useState<Store[]>([]);
-  const [locations, setLocations] = useState<Location[]>([]);
-  const [selectedStoreId, setSelectedStoreId] = useState<string>('');
-  const [selectedLocationId, setSelectedLocationId] = useState<string>('');
-  const [quantity, setQuantity] = useState<number>(1);
-  const [showAddProduct, setShowAddProduct] = useState(false);
-  const [newProduct, setNewProduct] = useState({
-    name: '',
-    sku: '',
-    costPrice: '',
-    retailPrice: '',
-    description: '',
-  });
-  const [stockInSuccess, setStockInSuccess] = useState(false);
-  // Continuous scanning state
-  const [continuousMode, setContinuousMode] = useState(false);
-  const [scannedItems, setScannedItems] = useState<ScannedItem[]>([]);
-  // Visual search state
-  const [visualSearchMode, setVisualSearchMode] = useState(false);
-  const [products, setProducts] = useState<Product[]>([]);
-  const [modelLoading, setModelLoading] = useState(false);
-  // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  const [visualPredictions, setVisualPredictions] = useState<{ className: string; probability: number }[]>([]);
-  const visualSearchRef = useRef<number | null>(null);
-  // OCR Search state
-  const [ocrMode, setOcrMode] = useState(false);
-  const [ocrResult, setOcrResult] = useState<OCRResult | null>(null);
-  const ocrSearchRef = useRef<number | null>(null);
-  // Combined Smart Search state
-  const [smartSearchMode, setSmartSearchMode] = useState(false);
-  // Shelf Scan state
   const [shelfScanMode, setShelfScanMode] = useState(false);
-  const [detectedObjects, setDetectedObjects] = useState<DetectedObject[]>([]);
-  const shelfScanRef = useRef<number | null>(null);
-  
+  const [aioScanMode, setAioScanMode] = useState(false); // All-in-One mode
+  const [isDemoMode, setIsDemoMode] = useState(false);
+  const [scanResult, setScanResult] = useState<ScannedProduct | null>(null);
+  const [productMatches, setProductMatches] = useState<ScannedProduct[]>([]);
+  const [batchResults, setBatchResults] = useState<CountedItem[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [ocrLoading, setOcrLoading] = useState(false);
+  const [embeddingLoaded, setEmbeddingLoaded] = useState(false);
+
+  // Shelf Scanning State
+  const [detectedObjects, setDetectedObjects] = useState<any[]>([]);
+  const [shelfCounts, setShelfCounts] = useState<Map<string, { name: string; count: number; barcode?: string }>>(new Map());
+  const [focusedProductId, setFocusedProductId] = useState<string | null>(null);
+  const [capturedImage, setCapturedImage] = useState<string | null>(null);
+  const [showImageCapture, setShowImageCapture] = useState(false);
+
   const videoRef = useRef<HTMLVideoElement>(null);
+  const demoImageRef = useRef<HTMLImageElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const readerRef = useRef<BrowserMultiFormatReader | null>(null);
+  const animationRef = useRef<number>();
+  const codeReaderRef = useRef<BrowserMultiFormatReader | null>(null);
+  const lastBarcodeRef = useRef<string | null>(null);
+  const ocrWorkerRef = useRef<any>(null);
+  const lastOcrTimeRef = useRef<number>(0);
+  const countManagerRef = useRef<CountManager>(getCountManager());
 
-  // Get user's store or fetch stores
+  const { user } = useAuthStore();
+  const currentStore = user?.store;
+
+  // Pre-load embedding model
   useEffect(() => {
-    if (user?.store) {
-      setSelectedStoreId(user.store.id);
-    }
-    fetchStores();
-  }, [user]);
+    loadEmbeddingModel()
+      .then(() => setEmbeddingLoaded(true))
+      .catch(err => console.error('Failed to load embedding model:', err));
+  }, []);
 
-  // Fetch locations when store changes
+  // Initialize OCR Worker
   useEffect(() => {
-    if (selectedStoreId) {
-      fetchLocations(selectedStoreId);
-      setSelectedLocationId('');
-    }
-  }, [selectedStoreId]);
-
-  const fetchStores = async () => {
-    try {
-      const response = await api.get('/stores');
-      setStores(response.data);
-      if (!user?.store && response.data.length > 0) {
-        setSelectedStoreId(response.data[0].id);
+    async function initWorker() {
+      try {
+        const worker = await createWorker('eng');
+        ocrWorkerRef.current = worker;
+      } catch (err) {
+        console.error('Failed to initialize OCR worker:', err);
       }
-    } catch (err) {
-      console.error('Failed to fetch stores:', err);
     }
-  };
-
-  const fetchLocations = async (storeId: string) => {
-    try {
-      const response = await api.get(`/locations?storeId=${storeId}`);
-      setLocations(response.data);
-    } catch (err) {
-      console.error('Failed to fetch locations:', err);
-      setLocations([]);
-    }
-  };
-
-  useEffect(() => {
+    initWorker();
     return () => {
-      if (readerRef.current) {
-        readerRef.current.reset();
+      if (ocrWorkerRef.current) {
+        ocrWorkerRef.current.terminate();
       }
     };
   }, []);
 
-  const startScanning = async (continuous: boolean = false) => {
-    setError(null);
-    setResult(null);
-    setProduct(null);
-    setInventory(null);
-    setStockInSuccess(false);
-    setShowAddProduct(false);
-    setScanning(true);
-    setContinuousMode(continuous);
-    if (!continuous) {
-      setScannedItems([]);
-    }
+  // Start scanning
+  const startScanning = useCallback(async (demo = false, mode: 'barcode' | 'shelf' | 'aio' = 'barcode') => {
+    // Prevent multiple camera streams
+    if (scanning && !demo) return;
 
-    try {
-      readerRef.current = new BrowserMultiFormatReader();
-      const videoInputDevices = await readerRef.current.listVideoInputDevices();
-      
-      if (videoInputDevices.length === 0) {
-        throw new Error('No camera found');
-      }
+    setIsDemoMode(demo);
+    setAioScanMode(mode === 'aio');
+    setShelfScanMode(mode === 'shelf' || mode === 'aio');
 
-      // Prefer back camera on mobile
-      const backCamera = videoInputDevices.find(
-        (device) => device.label.toLowerCase().includes('back') || 
-                   device.label.toLowerCase().includes('rear')
-      );
-      const selectedDeviceId = backCamera?.deviceId || videoInputDevices[0].deviceId;
-
-      readerRef.current.decodeFromVideoDevice(
-        selectedDeviceId,
-        videoRef.current!,
-        async (result, err) => {
-          if (result) {
-            const barcode = result.getText();
-            
-            if (continuous) {
-              // In continuous mode, keep scanning and count items
-              await handleContinuousScan(barcode);
+    if (!demo) {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: 'environment',
+            width: { ideal: 1920 },
+            height: { ideal: 1080 }
+          },
+          audio: false
+        });
+        if (videoRef.current) {
+          videoRef.current.srcObject = stream;
+          // Wait for video to be ready before scanning
+          await new Promise<void>((resolve) => {
+            if (videoRef.current!.readyState >= 2) {
+              resolve();
             } else {
-              // Single scan mode
-              setResult(barcode);
-              await lookupProduct(barcode);
-              stopScanning();
+              videoRef.current!.onloadedmetadata = () => resolve();
             }
-          }
-          if (err && !(err instanceof NotFoundException)) {
-            console.error(err);
+          });
+          // Only play if not already playing
+          if (videoRef.current.paused) {
+            await videoRef.current.play().catch(() => {});
           }
         }
-      );
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Failed to start scanner');
-      setScanning(false);
-    }
-  };
-
-  const handleContinuousScan = async (barcode: string) => {
-    try {
-      // Check if product already scanned
-      const existingIndex = scannedItems.findIndex(item => item.product.barcode === barcode);
-      
-      if (existingIndex >= 0) {
-        // Increment count
-        const updated = [...scannedItems];
-        updated[existingIndex].count += 1;
-        setScannedItems(updated);
-      } else {
-        // Lookup product and add to list
-        const response = await api.get(`/products/barcode/${encodeURIComponent(barcode)}`);
-        setScannedItems(prev => [...prev, { product: response.data, count: 1 }]);
-      }
-      
-      // Play a beep sound for feedback
-      playBeep();
-    } catch (err) {
-      // Product not found - ignore in continuous mode or could show warning
-      console.log('Product not found:', barcode);
-    }
-  };
-
-  const playBeep = () => {
-    const audioContext = new (window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext)();
-    const oscillator = audioContext.createOscillator();
-    const gainNode = audioContext.createGain();
-    oscillator.connect(gainNode);
-    gainNode.connect(audioContext.destination);
-    oscillator.frequency.value = 1000;
-    oscillator.type = 'sine';
-    gainNode.gain.value = 0.1;
-    oscillator.start();
-    oscillator.stop(audioContext.currentTime + 0.1);
-  };
-
-  // Visual Search Functions
-  const fetchProducts = async () => {
-    try {
-      const response = await api.get('/products?limit=100');
-      setProducts(response.data.data);
-    } catch (err) {
-      console.error('Failed to fetch products:', err);
-    }
-  };
-
-  const startVisualSearch = async () => {
-    setError(null);
-    setModelLoading(true);
-    setVisualSearchMode(true);
-    setScanning(true);
-    
-    try {
-      await loadModel();
-      await fetchProducts();
-      setModelLoading(false);
-      runVisualRecognition();
-    } catch (err) {
-      setError('Failed to start visual search');
-      setModelLoading(false);
-      setVisualSearchMode(false);
-      setScanning(false);
-    }
-  };
-
-  const runVisualRecognition = async () => {
-    if (!videoRef.current || !visualSearchMode) return;
-    
-    try {
-      const predictions = await classifyImage(videoRef.current);
-      setVisualPredictions(predictions);
-      
-      const matchedProduct = matchPredictionsToProducts(predictions);
-      
-      if (matchedProduct) {
-        playBeep();
-        setResult(matchedProduct.barcode);
-        setProduct(matchedProduct);
-        stopVisualSearch();
+      } catch (err) {
+        console.error('Failed to access camera:', err);
+        alert('Camera access denied or NOT available. Ensure you are using HTTPS on mobile.');
         return;
       }
-      
-      if (visualSearchMode) {
-        visualSearchRef.current = window.setTimeout(() => runVisualRecognition(), 1000);
-      }
+    }
+    setScanning(true);
+
+    // Barcode scanner runs in all modes (barcode only, shelf only, or AIO)
+    if (!demo && (mode === 'barcode' || mode === 'aio')) {
+      startBarcodeScanner();
+    }
+  }, []);
+
+  // Start barcode scanner
+  const startBarcodeScanner = async () => {
+    if (!codeReaderRef.current) {
+      const hints = new Map();
+      const formats = [
+        BarcodeFormat.EAN_13,
+        BarcodeFormat.EAN_8,
+        BarcodeFormat.UPC_A,
+        BarcodeFormat.UPC_E,
+        BarcodeFormat.CODE_128,
+        BarcodeFormat.CODE_39,
+        BarcodeFormat.CODE_93,
+        BarcodeFormat.CODABAR,
+        BarcodeFormat.ITF,
+        BarcodeFormat.QR_CODE,
+        BarcodeFormat.DATA_MATRIX,
+        BarcodeFormat.PDF_417
+      ];
+      hints.set(DecodeHintType.POSSIBLE_FORMATS, formats);
+      hints.set(DecodeHintType.TRY_HARDER, true);
+      hints.set(DecodeHintType.ASSUME_GS1, true);
+
+      codeReaderRef.current = new BrowserMultiFormatReader(hints);
+    }
+
+    try {
+      codeReaderRef.current.decodeFromVideoElement(
+        videoRef.current!,
+        async (result: any, error: any) => {
+          if (result) {
+            const barcode = result.getText();
+            console.log('Barcode detected:', barcode, 'Format:', result.barcodeFormat);
+
+            if (barcode !== lastBarcodeRef.current) {
+              lastBarcodeRef.current = barcode;
+              await handleBarcodeDetected(barcode);
+              flashCanvas('#10B981');
+
+              setTimeout(() => {
+                lastBarcodeRef.current = null;
+              }, 3000);
+            }
+          } else if (error && error.name !== 'NotFoundException' && error.name !== 'NotFoundExceptionornament') {
+            console.warn('Barcode scan error:', error.message);
+          }
+          // No barcode found - only run OCR in shelf/aio modes (not barcode-only mode)
+          // Throttle OCR to avoid excessive API calls
+          if (!result && (shelfScanMode || aioScanMode)) {
+            checkAndRunOCR();
+          }
+        }
+      );
     } catch (err) {
-      console.error('Visual recognition error:', err);
-      if (visualSearchMode) {
-        visualSearchRef.current = window.setTimeout(() => runVisualRecognition(), 1000);
+      console.error('Failed to start barcode scanner:', err);
+    }
+  };
+
+  // Canvas flash effect
+  const flashCanvas = (color: string) => {
+    if (canvasRef.current) {
+      const ctx = canvasRef.current.getContext('2d');
+      if (ctx) {
+        ctx.fillStyle = color;
+        ctx.globalAlpha = 0.3;
+        ctx.fillRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+        setTimeout(() => {
+          ctx.clearRect(0, 0, canvasRef.current!.width, canvasRef.current!.height);
+          ctx.globalAlpha = 1.0;
+        }, 150);
       }
     }
   };
 
-  const matchPredictionsToProducts = (predictions: { className: string; probability: number }[]): Product | null => {
-    for (const pred of predictions) {
-      const predLower = pred.className.toLowerCase();
-      
-      for (const product of products) {
-        const productNameLower = product.name.toLowerCase();
-        const productWords = productNameLower.split(' ').filter(w => w.length > 2);
-        
-        for (const word of productWords) {
-          if (predLower.includes(word) && pred.probability > 0.1) {
-            return product;
-          }
+  // OCR check
+  const checkAndRunOCR = async () => {
+    const now = Date.now();
+    if (now - lastOcrTimeRef.current < 4000) return;
+    // Run OCR in shelf and AIO modes (not in barcode-only mode)
+    if (!scanning || ocrLoading || !videoRef.current || !ocrWorkerRef.current) return;
+
+    lastOcrTimeRef.current = now;
+    await runOCR();
+  };
+
+  // Run OCR
+  const runOCR = async () => {
+    if (!videoRef.current || !ocrWorkerRef.current) return;
+
+    setOcrLoading(true);
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = videoRef.current.videoWidth;
+      canvas.height = videoRef.current.videoHeight;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+      ctx.drawImage(videoRef.current, 0, 0);
+
+      const { data } = await ocrWorkerRef.current.recognize(canvas);
+      const text = data.text;
+
+      if (text && text.trim().length > 3) {
+        const cleanedText = text.replace(/[^a-zA-Z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+        if (cleanedText.length > 3) {
+          const ocrResult: OCRResult = {
+            rawText: cleanedText,
+            words: cleanedText.split(' '),
+            possibleBrand: extractBrand(cleanedText),
+            possibleProductName: cleanedText,
+            confidence: data.confidence
+          };
+          await handleOcrResult(ocrResult, videoRef.current);
         }
-        
-        if (predLower.length > 3 && productNameLower.includes(predLower.split(' ')[0])) {
-          return product;
-        }
+      }
+    } catch (err) {
+      console.error('OCR error:', err);
+    } finally {
+      setOcrLoading(false);
+    }
+  };
+
+  // Simple brand extraction
+  const extractBrand = (text: string): string | null => {
+    const brands = [
+      'coca-cola', 'pepsi', 'nestle', 'cadbury', 'oreo', 'lays', 'doritos',
+      'kellogg', 'hershey', 'mars', 'kraft', 'unilever', 'dove', 'red bull',
+      'monster', 'starbucks', 'heinz', 'campbell', ' Quaker', 'capn crunch'
+    ];
+    const lower = text.toLowerCase();
+    for (const brand of brands) {
+      if (lower.includes(brand)) {
+        return brand.charAt(0).toUpperCase() + brand.slice(1);
       }
     }
     return null;
   };
 
-  const startShelfScan = async () => {
-    setError(null);
-    setModelLoading(true);
-    setShelfScanMode(true);
-    setScanning(true);
-    
+  // Handle OCR result with multi-modal matching
+  const handleOcrResult = async (ocrResult: OCRResult, _video: HTMLVideoElement) => {
     try {
-      await loadShelfModel();
-      setModelLoading(false);
-      runShelfDetection();
-    } catch (err) {
-      setError('Failed to start shelf scanner');
-      setModelLoading(false);
-      setShelfScanMode(false);
-      setScanning(false);
-    }
-  };
-
-  const runShelfDetection = async () => {
-    if (!videoRef.current || !shelfScanMode) return;
-    
-    try {
-      const detections = await detectProducts(videoRef.current);
-      setDetectedObjects(detections);
-      drawBoundingBoxes(detections);
-      
-      // Update counts based on unique detections
-      // In a real app, we'd more accurately match these to products
-      
-      if (shelfScanMode) {
-        shelfScanRef.current = window.setTimeout(() => runShelfDetection(), 200);
+      // Try to match via API
+      const response = await api.get(`/products?search=${encodeURIComponent(ocrResult.rawText)}`);
+      if (response.data.products && response.data.products.length > 0) {
+        const matches = response.data.products.map((p: any) => ({
+          ...p,
+          price: p.retailPrice,
+          image: p.images?.[0]?.url
+        }));
+        setProductMatches(matches);
+        flashCanvas('#3B82F6');
       }
     } catch (err) {
-      console.error('Shelf detection error:', err);
-      if (shelfScanMode) {
-        shelfScanRef.current = window.setTimeout(() => runShelfDetection(), 500);
-      }
+      console.error('OCR Search error:', err);
     }
   };
 
-  const drawBoundingBoxes = (detections: DetectedObject[]) => {
-    const canvas = canvasRef.current;
-    if (!canvas || !videoRef.current) return;
-    
-    const ctx = canvas.getContext('2d');
-    if (!ctx) return;
-    
-    // Match canvas size to video display size
-    canvas.width = videoRef.current.clientWidth;
-    canvas.height = videoRef.current.clientHeight;
-    
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-    
-    detections.forEach(det => {
-      const [x, y, width, height] = det.bbox;
-      
-      // Adjust coordinates based on video scale
-      const scaleX = canvas.width / videoRef.current!.videoWidth;
-      const scaleY = canvas.height / videoRef.current!.videoHeight;
-      
-      ctx.strokeStyle = '#0ea5e9';
-      ctx.lineWidth = 3;
-      ctx.strokeRect(x * scaleX, y * scaleY, width * scaleX, height * scaleY);
-      
-      ctx.fillStyle = '#0ea5e9';
-      ctx.font = '14px sans-serif';
-      ctx.fillText(`${det.id}`, x * scaleX, y * scaleY > 20 ? y * scaleY - 5 : 15);
-    });
-  };
-
-  const stopShelfScan = () => {
-    setShelfScanMode(false);
-    if (shelfScanRef.current) {
-      clearTimeout(shelfScanRef.current);
-    }
-    setScanning(false);
-    setDetectedObjects([]);
-  };
-
-  const stopVisualSearch = () => {
-    if (visualSearchRef.current) {
-      clearTimeout(visualSearchRef.current);
-      visualSearchRef.current = null;
-    }
-    setVisualSearchMode(false);
-    setScanning(false);
-    setVisualPredictions([]);
-  };
-
-  // OCR Search Functions
-  const startOcrSearch = async () => {
-    setError(null);
-    setModelLoading(true);
-    setOcrMode(true);
-    setScanning(true);
-    setOcrResult(null);
-    
-    try {
-      // Fetch products for matching
-      await fetchProducts();
-      setModelLoading(false);
-      
-      // Start OCR recognition loop
-      runOcrRecognition();
-    } catch (err) {
-      setError('Failed to start label search');
-      setModelLoading(false);
-      setOcrMode(false);
-      setScanning(false);
-    }
-  };
-
-  const runOcrRecognition = async () => {
-    if (!videoRef.current || !ocrMode) return;
-    
-    try {
-      // Analyze the image for text
-      const ocrResult = await analyzeProductLabel(videoRef.current);
-      setOcrResult(ocrResult);
-      
-      // Try to match OCR results with products
-      const matchedProduct = matchOCRToProducts(ocrResult, products);
-      
-      if (matchedProduct) {
-        playBeep();
-        // Fetch full product details
-        try {
-          const response = await api.get(`/products/${matchedProduct.product.id}`);
-          setProduct(response.data);
-          setResult(response.data.barcode);
-        } catch {
-          setProduct(matchedProduct.product as unknown as Product);
-          setResult(matchedProduct.product.barcode);
-        }
-        stopOcrSearch();
-        return;
-      }
-      
-      // Continue scanning every 2 seconds
-      if (ocrMode) {
-        ocrSearchRef.current = window.setTimeout(() => runOcrRecognition(), 2000);
-      }
-    } catch (err) {
-      console.error('OCR recognition error:', err);
-      if (ocrMode) {
-        ocrSearchRef.current = window.setTimeout(() => runOcrRecognition(), 2000);
-      }
-    }
-  };
-
-  const stopOcrSearch = () => {
-    if (ocrSearchRef.current) {
-      clearTimeout(ocrSearchRef.current);
-      ocrSearchRef.current = null;
-    }
-    setOcrMode(false);
-    setScanning(false);
-    setOcrResult(null);
-  };
-
-  // Smart Search - Combined Visual + OCR
-  const startSmartSearch = async () => {
-    setError(null);
-    setModelLoading(true);
-    setSmartSearchMode(true);
-    setScanning(true);
-    setOcrResult(null);
-    setVisualPredictions([]);
-    
-    try {
-      // Load models
-      await loadModel();
-      await fetchProducts();
-      setModelLoading(false);
-      
-      // Start combined recognition
-      runSmartSearch();
-    } catch (err) {
-      setError('Failed to start smart search');
-      setModelLoading(false);
-      setSmartSearchMode(false);
-      setScanning(false);
-    }
-  };
-
-  const runSmartSearch = async () => {
-    if (!videoRef.current || !smartSearchMode) return;
-    
-    try {
-      // Run both visual recognition and OCR in parallel
-      const [visualResult, ocrAnalysis] = await Promise.all([
-        classifyImage(videoRef.current).catch(() => []),
-        analyzeProductLabel(videoRef.current).catch(() => null)
-      ]);
-      
-      setVisualPredictions(visualResult);
-      if (ocrAnalysis) {
-        setOcrResult(ocrAnalysis);
-      }
-      
-      // Try matching with both methods
-      let matchedProduct = null;
-      
-      // 1. Try visual match
-      const visualMatch = matchPredictionsToProducts(visualResult);
-      if (visualMatch) {
-        matchedProduct = visualMatch;
-      }
-      
-      // 2. Try OCR match (higher priority if found)
-      if (ocrAnalysis) {
-        const ocrMatch = matchOCRToProducts(ocrAnalysis, products);
-        if (ocrMatch && ocrMatch.confidence > 0.5) {
-          matchedProduct = ocrMatch.product;
-        }
-      }
-      
-      if (matchedProduct) {
-        playBeep();
-        try {
-          const response = await api.get(`/products/${matchedProduct.id}`);
-          setProduct(response.data);
-          setResult(response.data.barcode);
-        } catch {
-          setProduct(matchedProduct as unknown as Product);
-          setResult(matchedProduct.barcode);
-        }
-        stopSmartSearch();
-        return;
-      }
-      
-      // Continue scanning
-      if (smartSearchMode) {
-        ocrSearchRef.current = window.setTimeout(() => runSmartSearch(), 1500);
-      }
-    } catch (err) {
-      console.error('Smart search error:', err);
-      if (smartSearchMode) {
-        ocrSearchRef.current = window.setTimeout(() => runSmartSearch(), 1500);
-      }
-    }
-  };
-
-  const stopSmartSearch = () => {
-    if (ocrSearchRef.current) {
-      clearTimeout(ocrSearchRef.current);
-      ocrSearchRef.current = null;
-    }
-    setSmartSearchMode(false);
-    setScanning(false);
-    setOcrResult(null);
-    setVisualPredictions([]);
-  };
-
-  const stopScanning = () => {
-    if (readerRef.current) {
-      readerRef.current.reset();
-    }
-    if (shelfScanMode) stopShelfScan();
-    setScanning(false);
-  };
-
-  const lookupProduct = async (barcode: string) => {
+  // Handle barcode detection
+  const handleBarcodeDetected = async (barcode: string) => {
     setLoading(true);
-    setError(null);
-    try {
-      const response = await api.get(`/products/barcode/${encodeURIComponent(barcode)}`);
-      setProduct(response.data);
-      // Check if product has inventory at selected store
-      const storeInventory = response.data.inventory?.find(
-        (inv: { store: { id: string } }) => inv.store.id === selectedStoreId
-      );
-      if (storeInventory) {
-        setInventory(storeInventory);
-      } else {
-        setInventory(null);
-      }
-    } catch (err: unknown) {
-      if (axios.isAxiosError(err) && err.response?.status === 404) {
-        // Product not found - show option to create
-        setProduct(null);
-        setShowAddProduct(true);
-      } else {
-        setError('Failed to lookup product');
-      }
-    } finally {
-      setLoading(false);
-    }
-  };
+    setScanResult(null);
 
-  const handleManualSearch = async (barcode: string) => {
-    if (!barcode.trim()) return;
-    setResult(barcode);
-    await lookupProduct(barcode);
-  };
-
-  const handleStockIn = async () => {
-    if (!product || !selectedStoreId) return;
-    
-    setLoading(true);
-    setError(null);
     try {
-      const response = await api.post('/inventory/stock-in', {
-        productId: product.id,
-        storeId: selectedStoreId,
-        locationId: selectedLocationId || undefined,
-        quantity: quantity,
+      const response = await api.post('/inventory/scan', {
+        barcode,
+        storeId: currentStore?.id || undefined
       });
-      setInventory(response.data);
-      setStockInSuccess(true);
-      setQuantity(1);
-    } catch (err: unknown) {
-      if (axios.isAxiosError(err)) {
-        setError(err.response?.data?.message || 'Failed to add stock');
-      } else {
-        setError('Failed to add stock');
+
+      const { product } = response.data;
+
+      if (!product) {
+        flashCanvas('#EF4444');
+        setScanResult({
+          id: 'not-found',
+          name: `Barcode: ${barcode}`,
+          sku: barcode,
+          price: 0,
+          isExternal: true,
+          notFound: true
+        });
+        return;
       }
+
+      // Register the product for visual re-identification
+      const productData = product.isExternal
+        ? { ...product, price: product.retailPrice || 0, sku: barcode, image: product.imageUrl }
+        : { ...product, price: product.retailPrice || 0, sku: product.sku || barcode, image: product.images?.[0]?.url };
+
+      setScanResult(productData);
+
+      // Capture snapshot if no product image exists
+      if (!product.imageUrl && !product.images?.[0]?.url && videoRef.current) {
+        captureProductSnapshot(product.id, barcode);
+      }
+
+      // Add to accumulated product matches list
+      setProductMatches(prev => {
+        // Check if this barcode already exists in the list
+        const exists = prev.some(p => p.barcode === barcode);
+        if (exists) {
+          return prev; // Don't duplicate
+        }
+        return [...prev, { ...productData, scannedAt: new Date().toISOString() }];
+      });
+
+      // Register in fingerprint system for future visual matching
+      if (videoRef.current) {
+        try {
+          await registerIdentifiedProduct(
+            product.id,
+            barcode,
+            product.name,
+            videoRef.current,
+            [0, 0, videoRef.current.videoWidth, videoRef.current.videoHeight]
+          );
+        } catch (err) {
+          console.error('Failed to register product fingerprint:', err);
+        }
+      }
+
+      // Play success sound
+      try {
+        const audio = new Audio('data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJOqk4F2d4yftJyGeXeMpLKcgHN3i6G0nIB1eI6kt5x/dHiLo7edf3V5jKO3nX91eYyktpx/dXmMpLadf3V5jKS2nX91eYyktZx/dXmMpLWcf3V5jKS1nH91eYyktZx/dXmMpLWcf3V5jKS1nA==');
+        audio.volume = 0.3;
+        audio.play().catch(() => {});
+      } catch { }
+
+    } catch (err: any) {
+      console.error('Scan lookup error:', err);
+      flashCanvas('#EF4444');
+
+      setScanResult({
+        id: 'error',
+        name: `Scanned: ${barcode}`,
+        sku: barcode,
+        price: 0,
+        isExternal: true,
+        notFound: true,
+        errorMessage: err.response?.data?.message || err.message || 'Unknown error'
+      });
     } finally {
       setLoading(false);
     }
   };
 
-  const handleCreateProduct = async () => {
-    // Get the actual barcode (remove 'NEW-' prefix if present)
-    const barcode = result?.startsWith('NEW-') ? result.replace('NEW-', '') : result;
-    
-    if (!barcode || !newProduct.name || !newProduct.sku || !newProduct.costPrice || !newProduct.retailPrice) {
-      setError('Please fill in all required fields');
+  // Capture a snapshot of the product from video and upload
+  const captureProductSnapshot = async (productId: string, barcode: string) => {
+    if (!videoRef.current) return;
+
+    try {
+      // Create a canvas to capture the current frame
+      const canvas = document.createElement('canvas');
+      canvas.width = videoRef.current.videoWidth;
+      canvas.height = videoRef.current.videoHeight;
+      const ctx = canvas.getContext('2d');
+      if (!ctx) return;
+
+      ctx.drawImage(videoRef.current, 0, 0);
+      const imageDataUrl = canvas.toDataURL('image/jpeg', 0.8);
+
+      // Upload to server
+      await api.post('/products/image', {
+        productId,
+        barcode,
+        image: imageDataUrl.split(',')[1] // Send base64 without prefix
+      });
+
+      console.log('Product snapshot captured and uploaded');
+    } catch (err) {
+      console.error('Failed to capture product snapshot:', err);
+    }
+  };
+
+  // Stop scanning
+  const stopScanning = () => {
+    setScanning(false);
+    setShelfScanMode(false);
+    setAioScanMode(false);
+    setDetectedObjects([]);
+    setShelfCounts(new Map());
+    setFocusedProductId(null);
+
+    if (codeReaderRef.current) {
+      try {
+        codeReaderRef.current.reset();
+      } catch {
+        // Ignore reset errors
+      }
+    }
+
+    if (videoRef.current && videoRef.current.srcObject) {
+      const stream = videoRef.current.srcObject as MediaStream;
+      stream.getTracks().forEach(track => track.stop());
+      videoRef.current.srcObject = null;
+    }
+
+    if (animationRef.current) {
+      cancelAnimationFrame(animationRef.current);
+    }
+
+    resetTracker();
+    resetCountManager();
+
+    const context = canvasRef.current?.getContext('2d');
+    context?.clearRect(0, 0, canvasRef.current?.width || 0, canvasRef.current?.height || 0);
+  };
+
+  // Start shelf scan mode
+  const startShelfScan = (demo = false) => {
+    resetCountManager();
+    startScanning(demo, 'shelf');
+  };
+
+  // Start AIO (All-in-One) scan mode - combines barcode + shelf detection
+  const startAioScan = (demo = false) => {
+    resetCountManager();
+    startScanning(demo, 'aio');
+  };
+
+  // Run shelf detection loop
+  const runShelfDetection = async () => {
+    if (!scanning || (!shelfScanMode && !aioScanMode)) return;
+
+    const source = isDemoMode ? demoImageRef.current : videoRef.current;
+    if (!source) {
+      animationRef.current = requestAnimationFrame(runShelfDetection);
       return;
     }
 
-    setLoading(true);
-    setError(null);
+    // Check if video has valid dimensions before processing
+    const hasValidDimensions = 'videoWidth' in source
+      ? source.videoWidth > 0 && source.videoHeight > 0
+      : 'naturalWidth' in source
+        ? source.naturalWidth > 0 && source.naturalHeight > 0
+        : true;
+
+    if (!hasValidDimensions) {
+      animationRef.current = requestAnimationFrame(runShelfDetection);
+      return;
+    }
+
     try {
-      const response = await api.post('/products', {
-        barcode: barcode,
-        ...newProduct,
-        costPrice: parseFloat(newProduct.costPrice),
-        retailPrice: parseFloat(newProduct.retailPrice),
+      const results = await detectProductsMultiModal(source, {
+        barcode: aioScanMode ? (lastBarcodeRef.current || undefined) : undefined
       });
-      setProduct(response.data);
-      setResult(barcode);
-      setShowAddProduct(false);
-    } catch (err: unknown) {
-      if (axios.isAxiosError(err)) {
-        setError(err.response?.data?.message || 'Failed to create product');
-      } else {
-        setError('Failed to create product');
+
+      setDetectedObjects(results.detectedObjects);
+
+      // Update shelf counts from CountedItems
+      const countedItems = countManagerRef.current.getCountedItems();
+      const countsMap = new Map<string, { name: string; count: number; barcode?: string }>();
+      for (const item of countedItems) {
+        countsMap.set(item.productId, { name: item.name, count: item.count, barcode: item.barcode });
       }
-    } finally {
-      setLoading(false);
+      setShelfCounts(countsMap);
+
+      // Update batch results for display
+      setBatchResults(countedItems);
+
+      // Draw bounding boxes with product info
+      if (canvasRef.current) {
+        drawBoundingBoxes(results.detectedObjects, source);
+      }
+    } catch (err) {
+      console.error('Detection error:', err);
+    }
+
+    animationRef.current = requestAnimationFrame(runShelfDetection);
+  };
+
+  // Handle canvas click to select/focus on a product
+  const handleCanvasClick = (event: React.MouseEvent<HTMLCanvasElement>) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+
+    const rect = canvas.getBoundingClientRect();
+    const clickX = event.clientX - rect.left;
+    const clickY = event.clientY - rect.top;
+
+    const displayWidth = canvas.clientWidth;
+    const displayHeight = canvas.clientHeight;
+
+    const sourceWidth = videoRef.current?.videoWidth || demoImageRef.current?.naturalWidth || 1;
+    const sourceHeight = videoRef.current?.videoHeight || demoImageRef.current?.naturalHeight || 1;
+    const scaleX = displayWidth / sourceWidth;
+    const scaleY = displayHeight / sourceHeight;
+
+    // Find clicked object
+    for (const obj of detectedObjects) {
+      if (!obj.productMatch) continue;
+      const [x, y, width, height] = obj.bbox;
+      const boxX = x * scaleX;
+      const boxY = y * scaleY;
+      const boxW = width * scaleX;
+      const boxH = height * scaleY;
+
+      if (clickX >= boxX && clickX <= boxX + boxW && clickY >= boxY && clickY <= boxY + boxH) {
+        // Toggle focus: if already focused, unfocus; otherwise focus on this product
+        if (focusedProductId === obj.productMatch.productId) {
+          setFocusedProductId(null);
+        } else {
+          setFocusedProductId(obj.productMatch.productId);
+        }
+        return;
+      }
+    }
+
+    // Clicked on empty space - clear focus
+    setFocusedProductId(null);
+  };
+
+  // Draw bounding boxes
+  const drawBoundingBoxes = (objects: any[], source: HTMLVideoElement | HTMLImageElement) => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    const displayWidth = canvas.clientWidth;
+    const displayHeight = canvas.clientHeight;
+
+    if (canvas.width !== displayWidth || canvas.height !== displayHeight) {
+      canvas.width = displayWidth;
+      canvas.height = displayHeight;
+    }
+
+    const sourceWidth = 'videoWidth' in source ? source.videoWidth : source.naturalWidth;
+    const sourceHeight = 'videoHeight' in source ? source.videoHeight : source.naturalHeight;
+    const scaleX = displayWidth / sourceWidth;
+    const scaleY = displayHeight / sourceHeight;
+
+    for (const obj of objects) {
+      const [x, y, width, height] = obj.bbox;
+      const isMatched = !!obj.productMatch;
+      const isFocused = focusedProductId && obj.productMatch?.productId === focusedProductId;
+      const isDimmed = focusedProductId && !isFocused;
+
+      // Dim non-focused products when filtering is active
+      const alpha = isDimmed ? 0.3 : 1;
+      const lineWidth = isFocused ? 4 : 2;
+
+      // Box color based on match status and focus
+      if (isFocused) {
+        ctx.strokeStyle = '#3B82F6'; // Blue for focused
+        ctx.fillStyle = 'rgba(59, 130, 246, 0.2)';
+      } else if (isMatched) {
+        ctx.strokeStyle = `rgba(16, 185, 129, ${alpha})`;
+        ctx.fillStyle = isDimmed ? 'rgba(0, 0, 0, 0.1)' : 'rgba(16, 185, 129, 0.1)';
+      } else {
+        ctx.strokeStyle = `rgba(245, 158, 11, ${alpha})`;
+        ctx.fillStyle = 'rgba(0, 0, 0, 0.1)';
+      }
+
+      ctx.lineWidth = lineWidth;
+      ctx.strokeRect(x * scaleX, y * scaleY, width * scaleX, height * scaleY);
+
+      // Fill for product matches
+      if (isMatched) {
+        ctx.fillRect(x * scaleX, y * scaleY, width * scaleX, height * scaleY);
+      }
+
+      // Product name label above the box
+      if (isMatched && obj.productMatch?.name) {
+        const label = isFocused
+          ? `[ ${obj.productMatch.name} ]`
+          : obj.productMatch.name;
+        ctx.font = `${isFocused ? 'bold ' : ''}12px Outfit`;
+        const textWidth = ctx.measureText(label).width;
+
+        // Background for label
+        ctx.fillStyle = isFocused ? 'rgba(59, 130, 246, 0.9)' : isDimmed ? 'rgba(100, 100, 100, 0.7)' : 'rgba(0, 0, 0, 0.7)';
+        const labelX = x * scaleX;
+        const labelY = y * scaleY - 10;
+        ctx.fillRect(labelX, labelY - 14, textWidth + 12, 18);
+
+        // Label text
+        ctx.fillStyle = isFocused || !isDimmed ? 'white' : '#aaa';
+        ctx.fillText(label, labelX + 6, labelY);
+      }
+
+      // Confidence label (below box)
+      ctx.fillStyle = isMatched ? `rgba(16, 185, 129, ${alpha})` : `rgba(245, 158, 11, ${alpha})`;
+      ctx.font = `${isFocused ? 'bold ' : ''}10px Outfit`;
+      const confLabel = isMatched
+        ? `${Math.round(obj.productMatch.confidence * 100)}%`
+        : `${obj.class} ${Math.round(obj.score * 100)}%`;
+      const confWidth = ctx.measureText(confLabel).width;
+      ctx.fillStyle = isFocused ? 'rgba(59, 130, 246, 0.8)' : 'rgba(0, 0, 0, 0.5)';
+      ctx.fillRect(x * scaleX, (y + height) * scaleY + 2, confWidth + 8, 14);
+      ctx.fillStyle = isDimmed ? '#aaa' : 'white';
+      ctx.fillText(confLabel, x * scaleX + 4, (y + height) * scaleY + 13);
+    }
+
+    // Draw count summary overlay
+    if (shelfCounts.size > 0) {
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+      ctx.fillRect(10, 10, 200, 20 + shelfCounts.size * 24);
+      ctx.fillStyle = 'white';
+      ctx.font = 'bold 12px Outfit';
+      ctx.fillText('Product Counts:', 20, 30);
+
+      let yOffset = 50;
+      for (const [_, item] of shelfCounts) {
+        ctx.fillStyle = '#10B981';
+        ctx.fillText(`${item.name}: ${item.count}`, 20, yOffset);
+        yOffset += 22;
+      }
     }
   };
 
-  const resetScanner = () => {
-    setResult(null);
-    setProduct(null);
-    setInventory(null);
-    setStockInSuccess(false);
-    setShowAddProduct(false);
-    setNewProduct({ name: '', sku: '', costPrice: '', retailPrice: '', description: '' });
-    setQuantity(1);
-    setSelectedLocationId('');
-    setScannedItems([]);
-    setContinuousMode(false);
-  };
-
-  const addAllToInventory = async () => {
-    if (scannedItems.length === 0 || !selectedStoreId) return;
-    
-    setLoading(true);
-    setError(null);
-    try {
-      // Add each scanned item to inventory
-      for (const item of scannedItems) {
-        await api.post('/inventory/stock-in', {
-          productId: item.product.id,
-          storeId: selectedStoreId,
-          locationId: selectedLocationId || undefined,
-          quantity: item.count,
-        });
-      }
-      
-      setStockInSuccess(true);
-      setScannedItems([]);
-      setContinuousMode(false);
-    } catch (err: unknown) {
-      if (axios.isAxiosError(err)) {
-        setError(err.response?.data?.message || 'Failed to add items to inventory');
-      } else {
-        setError('Failed to add items to inventory');
-      }
-    } finally {
-      setLoading(false);
+  // Run detection loop when shelf mode is active
+  useEffect(() => {
+    if (scanning && (shelfScanMode || aioScanMode)) {
+      runShelfDetection();
     }
-  };
+    return () => {
+      if (animationRef.current) cancelAnimationFrame(animationRef.current);
+    };
+  }, [scanning, shelfScanMode, aioScanMode]);
+
+  // Get tracker stats for display
+  const [trackerStats, setTrackerStats] = useState({ trackedCount: 0, matchedCount: 0, matchRate: 0 });
+  useEffect(() => {
+    if (scanning && (shelfScanMode || aioScanMode)) {
+      const interval = setInterval(() => {
+        const stats = getTrackerStats();
+        setTrackerStats(stats);
+      }, 500);
+      return () => clearInterval(interval);
+    }
+  }, [scanning, shelfScanMode, aioScanMode]);
 
   return (
-    <div className="space-y-10 animate-fade-in pb-24">
-      {/* Header */}
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-6">
-        <div>
-          <h1 className="text-3xl lg:text-4xl font-black text-slate-900 dark:text-white font-heading tracking-tight">Scanner Hub</h1>
-          <p className="text-slate-500 dark:text-slate-400 font-medium tracking-tight">AI-Powered Neural Inventory Intelligence</p>
-        </div>
-        <div className="flex items-center gap-3">
-          <div className="px-4 py-2 bg-white dark:bg-slate-800 rounded-xl border border-slate-200/50 dark:border-slate-700/50 text-[10px] font-black uppercase tracking-widest text-slate-500 shadow-sm transition-colors">
-             Scanner Status: <span className={scanning ? 'text-emerald-500 animate-pulse' : 'text-slate-400'}>{scanning ? 'Active' : 'Standby'}</span>
-          </div>
-        </div>
+    <div className="max-w-6xl mx-auto animate-in">
+      <div className="flex items-center justify-between mb-6">
+        <h1 className="text-2xl font-bold text-slate-900 dark:text-white">Scanner</h1>
+
+        {scanning && (
+          <button
+            onClick={stopScanning}
+            className="flex items-center gap-2 px-4 py-2 bg-red-600 hover:bg-red-700 text-white font-bold rounded-lg transition-all shadow-md"
+          >
+            <span className="w-2 h-2 rounded-full bg-white animate-pulse" />
+            Stop
+          </button>
+        )}
       </div>
 
-      <div className="max-w-xl mx-auto space-y-10">
+      {/* Embedding model status */}
+      {!embeddingLoaded && (
+        <div className="mb-4 p-3 bg-amber-50 dark:bg-amber-900/20 border border-amber-200 dark:border-amber-700 rounded-lg">
+          <p className="text-sm text-amber-700 dark:text-amber-300">
+            Loading AI model... Visual recognition will be available shortly.
+          </p>
+        </div>
+      )}
+
+      {/* Full-width scanner */}
+      <div className="relative bg-slate-900 rounded-2xl overflow-hidden shadow-2xl" style={{ maxHeight: '70vh' }}>
         <ScannerView
           ref={videoRef}
           scanning={scanning}
-          shelfScanMode={shelfScanMode}
-          continuousMode={continuousMode}
+          shelfScanMode={shelfScanMode || aioScanMode}
+          continuousMode={shelfScanMode || aioScanMode}
           detectedObjectsCount={detectedObjects.length}
           onStartSingle={() => startScanning(false)}
+          isDemoMode={isDemoMode}
+          demoImageRef={demoImageRef}
+          canvasRef={canvasRef}
+          onCanvasClick={handleCanvasClick}
         />
 
-        {scanning && (
-          <div className="animate-fade-in">
-            <button
-              onClick={() => {
-                if (shelfScanMode) stopShelfScan();
-                else if (smartSearchMode) stopSmartSearch();
-                else if (visualSearchMode) stopVisualSearch();
-                else if (ocrMode) stopOcrSearch();
-                else stopScanning();
-              }}
-              className="w-full bg-red-500 hover:bg-red-600 text-white py-5 rounded-2xl font-black uppercase tracking-[0.2em] shadow-xl shadow-red-500/20 active:scale-95 transition-all flex items-center justify-center gap-3 group"
-            >
-              <div className="w-2 h-2 rounded-full bg-white animate-ping" />
-              Terminate Intelligence Sync
-            </button>
-          </div>
-        )}
-
-        {/* Scan Mode Grid */}
-        {!scanning && !result && !product && (
-          <div className="space-y-6">
-            <div className="grid grid-cols-1 gap-4">
-              <button
-                onClick={startShelfScan}
-                disabled={modelLoading}
-                className="premium-card p-1 text-left group transition-all duration-500 hover:-translate-y-1 active:scale-[0.98]"
-              >
-                <div className="bg-gradient-to-br from-indigo-600 to-sky-600 dark:from-indigo-500 dark:to-sky-500 rounded-[1.4rem] p-8 relative overflow-hidden">
-                  <div className="absolute top-0 right-0 w-32 h-32 bg-white/10 rounded-full blur-2xl translate-x-1/2 -translate-y-1/2 group-hover:scale-150 transition-transform duration-700" />
-                  <div className="relative z-10 flex items-start justify-between">
-                    <div>
-                      <span className="inline-flex items-center gap-2 px-3 py-1 rounded-lg bg-white/20 text-white text-[9px] font-black uppercase tracking-widest mb-4 backdrop-blur-md">
-                        <div className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse" />
-                        Neural Engine
-                      </span>
-                      <h3 className="text-3xl font-black text-white font-heading tracking-tight mb-2">Shelf Scan</h3>
-                      <p className="text-sky-100/70 text-sm font-medium leading-relaxed max-w-[240px]">Multi-object neural counting and spatial asset tracking.</p>
-                    </div>
-                    <div className="w-14 h-14 rounded-2xl bg-white/10 backdrop-blur-md border border-white/20 flex items-center justify-center group-hover:rotate-12 transition-transform shadow-xl">
-                      <svg className="w-7 h-7 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
-                        <path strokeLinecap="round" strokeLinejoin="round" d="M15 10.5a3 3 0 11-6 0 3 3 0 016 0z" />
-                        <path strokeLinecap="round" strokeLinejoin="round" d="M19.5 10.5c0 7.142-7.5 11.25-7.5 11.25S4.5 17.642 4.5 10.5a7.5 7.5 0 1115 0z" />
-                      </svg>
-                    </div>
-                  </div>
-                </div>
-              </button>
-            </div>
-
-            <div className="grid grid-cols-1 gap-4">
-              <button
-                onClick={startSmartSearch}
-                disabled={modelLoading}
-                className="premium-card p-6 flex items-center justify-between group hover:border-indigo-500/30 transition-all active:scale-[0.98]"
-              >
-                <div className="flex items-center gap-5">
-                   <div className="w-14 h-14 rounded-2xl bg-indigo-50 dark:bg-indigo-500/10 flex items-center justify-center group-hover:scale-110 transition-transform">
-                      <svg className="w-7 h-7 text-indigo-600 dark:text-indigo-400" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
-                         <path strokeLinecap="round" strokeLinejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09zM18.25 15L17.437 17.846a1.125 1.125 0 01-1.542 1.542L15 18.25l.813-2.846a1.125 1.125 0 011.542-1.542L18.25 15z" />
-                      </svg>
-                   </div>
-                   <div className="text-left">
-                      <h4 className="text-xl font-black text-slate-900 dark:text-white font-heading tracking-tight uppercase">Smart Fusion</h4>
-                      <p className="text-[10px] font-black text-slate-400 uppercase tracking-widest mt-0.5">OCR + Visual Shape Detection</p>
-                   </div>
-                </div>
-                <svg className="w-6 h-6 text-slate-300 group-hover:text-indigo-500 group-hover:translate-x-1 transition-all" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
-                   <path strokeLinecap="round" strokeLinejoin="round" d="M13.5 4.5L21 12m0 0l-7.5 7.5M21 12H3" />
+        {!scanning && (
+          <div className="absolute inset-0 flex items-center justify-center bg-slate-900/70 backdrop-blur-sm">
+            <div className="text-center">
+              <div className="w-20 h-20 bg-emerald-600 rounded-2xl flex items-center justify-center mx-auto mb-4 shadow-xl">
+                <svg width="40" height="40" className="text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M6.827 6.175A2.31 2.31 0 015.186 7.23c-.38.054-.757.112-1.134.175C2.999 7.58 2.25 8.507 2.25 9.574V18a2.25 2.25 0 002.25 2.25h15a2.25 2.25 0 002.25-2.25V9.574c0-1.067-.75-1.994-1.802-2.169a47.865 47.865 0 00-1.134-.175 2.31 2.31 0 01-1.64-1.055l-.822-1.316a2.192 2.192 0 00-1.736-1.039 48.774 48.774 0 00-5.232 0 2.192 2.192 0 00-1.736 1.039l-.821 1.316z" />
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M16.5 12.75a4.5 4.5 0 11-9 0 4.5 4.5 0 019 0zM18.75 10.5h.008v.008h-.008V10.5z" />
                 </svg>
-              </button>
-            </div>
-
-            <div className="grid grid-cols-2 gap-4">
-              {[
-                { label: 'Barcode', desc: 'Standard SKU Sync', icon: 'M3.75 4.875c0-.621.504-1.125 1.125-1.125h4.5c.621 0 1.125.504 1.125 1.125v4.5c0 .621-.504 1.125-1.125 1.125h-4.5a1.125 1.125 0 01-1.125-1.125v-4.5zM3.75 14.625c0-.621.504-1.125 1.125-1.125h4.5c.621 0 1.125.504 1.125 1.125v4.5c0 .621-.504 1.125-1.125 1.125h-4.5a1.125 1.125 0 01-1.125-1.125v-4.5zM13.5 4.875c0-.621.504-1.125 1.125-1.125h4.5c.621 0 1.125.504 1.125 1.125v4.5c0 .621-.504 1.125-1.125 1.125h-4.5a1.125 1.125 0 01-1.125-1.125v-4.5z', action: () => startScanning(false) },
-                { label: 'Continuous', desc: 'High-Volume Intake', icon: 'M16.023 9.348h4.992v-.001M2.985 19.644v-4.992m0 0h4.992m-4.993 0l3.181 3.183a8.25 8.25 0 0013.803-3.7M4.031 9.865a8.25 8.25 0 0113.803-3.7l3.181 3.182m0-4.991v4.99', action: () => startScanning(true) }
-              ].map((btn, i) => (
-                <button
-                  key={i}
-                  onClick={btn.action}
-                  className="premium-card p-6 text-left group hover:bg-slate-50 dark:hover:bg-slate-800/40 transition-all active:scale-95"
-                >
-                  <div className={`w-10 h-10 rounded-xl bg-slate-100 dark:bg-slate-800 flex items-center justify-center mb-4 group-hover:scale-110 transition-transform ${i === 0 ? 'group-hover:text-sky-500' : 'group-hover:text-emerald-500'}`}>
-                    <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
-                      <path strokeLinecap="round" strokeLinejoin="round" d={btn.icon} />
-                    </svg>
-                  </div>
-                  <h5 className="text-sm font-black text-slate-900 dark:text-white font-heading tracking-tight uppercase">{btn.label}</h5>
-                  <p className="text-[10px] font-bold text-slate-400 dark:text-slate-500 uppercase tracking-widest mt-0.5">{btn.desc}</p>
-                </button>
-              ))}
-            </div>
-            
-            <div className="grid grid-cols-2 gap-4">
-               <button
-                  onClick={startVisualSearch}
-                  disabled={modelLoading}
-                  className="w-full py-4 text-[9px] font-black uppercase tracking-[0.2em] text-slate-500 dark:text-slate-400 hover:text-indigo-500 dark:hover:text-indigo-400 transition-colors border-2 border-dashed border-slate-200 dark:border-slate-800 rounded-2xl hover:border-indigo-500/30 flex items-center justify-center gap-2"
-               >
-                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path d="M2.25 15.75l5.159-5.159a2.25 2.25 0 013.182 0l5.159 5.159m-1.5-1.5l1.409-1.409a2.25 2.25 0 013.182 0l2.909 2.909m-18 3.75h16.5a1.5 1.5 0 001.5-1.5V6a1.5 1.5 0 00-1.5-1.5H3.75A1.5 1.5 0 002.25 6v12a1.5 1.5 0 001.5 1.5zm10.5-11.25h.008v.008h-.008V8.25zm.375 0a.375.375 0 11-.75 0 .375.375 0 01.75 0z" /></svg>
-                  Visual Search
-               </button>
-               <button
-                  onClick={startOcrSearch}
-                  disabled={modelLoading}
-                  className="w-full py-4 text-[9px] font-black uppercase tracking-[0.2em] text-slate-500 dark:text-slate-400 hover:text-indigo-500 dark:hover:text-indigo-400 transition-colors border-2 border-dashed border-slate-200 dark:border-slate-800 rounded-2xl hover:border-indigo-500/30 flex items-center justify-center gap-2"
-               >
-                  <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path d="M19.5 14.25v-2.625a3.375 3.375 0 00-3.375-3.375h-1.5A1.125 1.125 0 0113.5 7.125v-1.5a3.375 3.375 0 00-3.375-3.375H8.25m0 12.75h7.5m-7.5 3H12M10.5 2.25H5.625c-.621 0-1.125.504-1.125 1.125v17.25c0 .621.504 1.125 1.125 1.125h12.75c.621 0 1.125-.504 1.125-1.125V11.25a9 9 0 00-9-9z" /></svg>
-                  Label Search
-               </button>
+              </div>
+              <h2 className="text-2xl font-bold text-white mb-2">AI Inventory Scanner</h2>
+              <p className="text-slate-400 text-sm mb-6">Select a mode below to start</p>
             </div>
           </div>
         )}
+      </div>
 
-        {/* Error Message */}
-        {error && (
-          <div className="bg-red-50 dark:bg-red-500/10 border border-red-100 dark:border-red-500/20 text-red-600 dark:text-red-400 p-6 rounded-2xl animate-shake shadow-lg shadow-red-500/5 flex items-center gap-4">
-             <div className="w-10 h-10 rounded-full bg-red-100 dark:bg-red-500/20 flex items-center justify-center shrink-0">
-                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}><path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" /></svg>
-             </div>
-             <div>
-                <p className="text-[10px] font-black uppercase tracking-widest mb-0.5">Intelligence Error</p>
-                <p className="font-bold">{error}</p>
-             </div>
-          </div>
-        )}
+      {/* Compact mode buttons */}
+      <div className="flex flex-wrap justify-center gap-3 mt-4">
+        <button
+          onClick={() => startAioScan(false)}
+          className="flex items-center gap-2 px-6 py-3 bg-emerald-600 hover:bg-emerald-700 text-white font-bold rounded-xl shadow-lg transition-all"
+        >
+          <svg width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z" />
+          </svg>
+          AI Scanner
+        </button>
+        <button
+          onClick={() => startScanning(false, 'barcode')}
+          className="flex items-center gap-2 px-6 py-3 bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600 text-slate-800 dark:text-white font-bold rounded-xl transition-all"
+        >
+          <svg width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M3.75 4.875c0-.621.504-1.125 1.125-1.125h4.5c.621 0 1.125.504 1.125 1.125v4.5c0 .621-.504 1.125-1.125 1.125h-4.5A1.125 1.125 0 013.75 9.375v-4.5zM13.5 4.875c0-.621.504-1.125 1.125-1.125h4.5c.621 0 1.125.504 1.125 1.125v4.5c0 .621-.504 1.125-1.125 1.125h-4.5A1.125 1.125 0 0113.5 9.375v-4.5z" />
+          </svg>
+          Barcode
+        </button>
+        <button
+          onClick={() => startShelfScan(false)}
+          className="flex items-center gap-2 px-6 py-3 bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600 text-slate-800 dark:text-white font-bold rounded-xl transition-all"
+        >
+          <svg width="20" height="20" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M9.75 3.104v5.714a2.25 2.25 0 01-.659 1.591L5 14.5M9.75 3.104c-.251.023-.501.05-.75.082m.75-.082a24.301 24.301 0 014.5 0m0 0v5.714c0 .597.237 1.17.659 1.591L19.8 15.3M14.25 3.104c.251.023.501.05.75.082M19.8 15.3l-1.57.393A9.065 9.065 0 0112 15a9.065 9.065 0 00-6.23-.693L5 14.5m14.8.8l1.402 1.402c1.232 1.232.65 3.318-1.067 3.611l-2.278.565a9.04 9.04 0 01-2.891 0l-2.278-.565c-1.717-.293-2.3-2.379-1.067-3.611L5 14.5" />
+          </svg>
+          Shelf Count
+        </button>
+        <button
+          onClick={() => startAioScan(true)}
+          className="px-6 py-3 text-sm font-bold text-slate-400 hover:text-emerald-600 transition-colors"
+        >
+          Demo
+        </button>
+      </div>
 
-        {/* Success Message */}
-        {stockInSuccess && (
-          <div className="bg-emerald-50 dark:bg-emerald-500/10 border border-emerald-100 dark:border-emerald-500/20 text-emerald-600 dark:text-emerald-400 p-6 rounded-2xl animate-fade-in shadow-lg shadow-emerald-500/5 flex items-center gap-4">
-             <div className="w-10 h-10 rounded-full bg-emerald-100 dark:bg-emerald-500/20 flex items-center justify-center shrink-0">
-                <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}><path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" /></svg>
-             </div>
-             <div>
-                <p className="text-[10px] font-black uppercase tracking-widest mb-0.5">Asset Logged</p>
-                <p className="font-bold">Successfully synchronized unit(s) to the inventory mesh.</p>
-             </div>
-          </div>
-        )}
-
-        {/* Loading Global */}
-        {loading && (
-          <div className="flex flex-col items-center justify-center py-12 animate-fade-in">
-            <div className="relative w-16 h-16 mb-6">
-               <div className="absolute inset-0 border-4 border-indigo-100 dark:border-indigo-900/30 rounded-full" />
-               <div className="absolute inset-0 border-4 border-indigo-500 border-t-transparent rounded-full animate-spin shadow-xl shadow-indigo-500/20" />
-            </div>
-            <p className="text-[10px] font-black text-slate-400 uppercase tracking-[0.3em] animate-pulse">Processing Neural Request...</p>
-          </div>
-        )}
+      {/* Analysis Results */}
+      <div className="mt-6">
+        <div className="flex items-center justify-between mb-4">
+          <h3 className="text-xl font-bold">Results</h3>
+          {embeddingLoaded && scanning && (
+            <span className="badge badge-success animate-pulse">AI Active</span>
+          )}
+        </div>
 
         <ScanResults
-          product={product}
-          scannedItems={scannedItems}
-          continuousMode={continuousMode}
+          scanResult={scanResult}
+          productMatches={productMatches}
+          batchResults={batchResults}
+          shelfCounts={shelfCounts}
+          onSelectProduct={(p) => setScanResult(p)}
           onClear={() => {
-            setScannedItems([]);
-            setContinuousMode(false);
+            setScanResult(null);
+            setBatchResults([]);
+            setProductMatches([]);
+            setFocusedProductId(null);
           }}
-          onAddAll={addAllToInventory}
+          onCommitBatch={async () => {
+            for (const item of batchResults) {
+              try {
+                await api.post('/inventory/count', {
+                  productId: item.productId,
+                  count: item.count,
+                  storeId: currentStore?.id
+                });
+              } catch (err) {
+                console.error('Failed to commit count:', err);
+              }
+            }
+            setBatchResults([]);
+          }}
+          onAdjustCount={(productId, newCount) => {
+            countManagerRef.current.adjustCount(productId, newCount);
+            const countedItems = countManagerRef.current.getCountedItems();
+            setBatchResults(countedItems);
+            const countsMap = new Map<string, { name: string; count: number; barcode?: string }>();
+            for (const item of countedItems) {
+              countsMap.set(item.productId, { name: item.name, count: item.count, barcode: item.barcode });
+            }
+            setShelfCounts(countsMap);
+          }}
           loading={loading}
-          visualPredictions={visualPredictions}
-          ocrResult={ocrResult}
-          smartSearchMode={smartSearchMode}
         />
 
-        {!loading && product && (
-          <StockUpdateForm
-            product={product}
-            inventory={inventory}
-            quantity={quantity}
-            onQuantityChange={setQuantity}
-            selectedStoreId={selectedStoreId}
-            onStoreChange={setSelectedStoreId}
-            selectedLocationId={selectedLocationId}
-            onLocationChange={setSelectedLocationId}
-            stores={stores}
-            locations={locations}
-            onUpdate={handleStockIn}
-            loading={loading}
-            success={stockInSuccess}
-          />
-        )}
-
-        {!loading && showAddProduct && !product && (
-          <ProductForm
-            formData={newProduct}
-            onChange={(e) => setNewProduct({ ...newProduct, [e.target.name]: Number(e.target.value) || e.target.value })}
-            onSubmit={handleCreateProduct}
-            onCancel={resetScanner}
-            loading={loading}
-          />
-        )}
-
-        {/* Manual Entry UI */}
-        {!result && !scanning && (
-          <div className="pt-10 border-t border-slate-100 dark:border-slate-800 animate-fade-in-up">
-            <div className="flex flex-col gap-6">
-               <div className="premium-card p-8 bg-slate-50 dark:bg-slate-900/50 border-slate-200/50 dark:border-slate-800">
-                  <label className="text-[10px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-[0.2em] mb-4 block">Manual Override</label>
-                  <div className="flex gap-3">
-                    <input
-                      type="text"
-                      id="manualBarcode"
-                      placeholder="Enter Asset ID / Barcode..."
-                      className="flex-1 input-premium py-4"
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') {
-                          handleManualSearch((e.currentTarget as HTMLInputElement).value);
-                        }
-                      }}
-                    />
-                    <button 
-                      onClick={() => {
-                        const input = document.getElementById('manualBarcode') as HTMLInputElement;
-                        handleManualSearch(input.value);
-                      }}
-                      className="btn-premium px-8 font-black text-[10px] uppercase tracking-widest shadow-lg"
-                    >
-                      SEARCH
-                    </button>
-                  </div>
-               </div>
-
-               <button
-                  onClick={() => {
-                    setShowAddProduct(true);
-                    setResult('NEW-' + Date.now());
-                  }}
-                  className="w-full py-5 rounded-2xl border-2 border-dashed border-slate-200 dark:border-slate-800 text-[10px] font-black uppercase tracking-[0.3em] text-slate-400 hover:text-indigo-500 dark:hover:text-indigo-400 hover:border-indigo-500/30 transition-all active:scale-[0.98] flex items-center justify-center gap-3 group"
-               >
-                  <svg className="w-4 h-4 group-hover:rotate-180 transition-transform duration-500" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}><path strokeLinecap="round" strokeLinejoin="round" d="M12 4.5v15m7.5-7.5h-15" /></svg>
-                  Register Unidentified Asset
-               </button>
-            </div>
+        {!scanResult && batchResults.length === 0 && !loading && (
+          <div className="text-center py-12 text-slate-400">
+            <p>Point camera at a product to start scanning</p>
           </div>
         )}
       </div>

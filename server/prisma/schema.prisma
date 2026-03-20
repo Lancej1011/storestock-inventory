@@ -73,6 +73,8 @@ model Store {
   inventory         Inventory[]
   purchaseOrders    PurchaseOrder[]
   stockTransactions StockTransaction[]
+  productEmbeddings ProductEmbedding[]
+  aisleLayouts      AisleLayout[]
 
   @@map("stores")
 }
@@ -288,4 +290,32 @@ model AuditLog {
   @@index([entityType, entityId])
   @@index([createdAt])
   @@map("audit_logs")
+}
+
+model ProductEmbedding {
+  id          String   @id @default(uuid())
+  productId   String   @unique @map("product_id")
+  barcode     String?  @unique
+  name        String
+  embedding   Json     // 1280-dimensional array stored as JSON
+  storeId     String?  @map("store_id")
+  store       Store?   @relation(fields: [storeId], references: [id])
+  lastUpdated DateTime @default(now()) @map("last_updated")
+
+  @@map("product_embeddings")
+}
+
+model AisleLayout {
+  id               String   @id @default(uuid())
+  storeId          String   @map("store_id")
+  store            Store    @relation(fields: [storeId], references: [id])
+  aisleNumber      String   @map("aisle_number")
+  description      String?
+  categories       String[] // Array of category names
+  dominantProducts String[] @map("dominant_products") // Product IDs commonly found here
+  confidence       Float    @default(0.5)
+  lastSeen         DateTime @default(now()) @map("last_seen")
+
+  @@unique([storeId, aisleNumber])
+  @@map("aisle_layouts")
 }

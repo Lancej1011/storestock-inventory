@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { PrismaClient } from '@prisma/client';
 import { authenticate, authorize, AuthRequest } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
+import { fetchProductByBarcode } from '../utils/upcService.js';
 
 const router = Router();
 const prisma = new PrismaClient();
@@ -468,19 +469,108 @@ router.post('/scan', authenticate, async (req: AuthRequest, res: Response, next)
   try {
     const { barcode, storeId } = req.body;
 
-    const product = await prisma.product.findUnique({
-      where: { barcode },
-      include: { images: { where: { isPrimary: true } } },
-    });
-
-    if (!product) {
-      throw new AppError('Product not found', 404);
+    if (!barcode || typeof barcode !== 'string') {
+      throw new AppError('Valid barcode is required', 400);
     }
 
-    const inventory = await prisma.inventory.findFirst({
-      where: { productId: product.id, storeId },
-      include: { location: true },
-    });
+    console.log(`[Scan] Looking up barcode: ${barcode}`);
+
+    let product;
+    try {
+      product = await prisma.product.findUnique({
+        where: { barcode },
+        include: { images: true },
+      });
+    } catch (dbError) {
+      console.error('Database error looking up product:', dbError);
+      throw new AppError('Database error while looking up product', 500);
+    }
+
+    if (!product) {
+      console.log(`[Scan] Product not in local DB, checking external UPC services...`);
+      // Not found locally, check external UPC service
+      let externalProduct;
+      try {
+        externalProduct = await fetchProductByBarcode(barcode);
+      } catch (externalError) {
+        console.error('External UPC lookup error:', externalError);
+        // Continue to 404 - external lookup failure shouldn't cause 500
+        externalProduct = null;
+      }
+
+      if (externalProduct) {
+        console.log(`[Scan] Found external product: ${externalProduct.name} from ${externalProduct.source}`);
+
+        // Auto-save to local database for future lookups
+        try {
+          const newProduct = await prisma.product.create({
+            data: {
+              name: externalProduct.name,
+              barcode: externalProduct.barcode,
+              description: externalProduct.description || '',
+              sku: externalProduct.barcode, // Use barcode as SKU
+              retailPrice: externalProduct.retailPrice || 0,
+              costPrice: 0, // Default cost price
+              isActive: true,
+            },
+            include: { images: true },
+          });
+          console.log(`[Scan] Saved product to local DB: ${newProduct.name} (ID: ${newProduct.id})`);
+
+          return res.json({
+            product: newProduct,
+            savedNew: true // Flag to tell client it was just saved
+          });
+        } catch (saveError: any) {
+          // If save fails (e.g., duplicate barcode), still return the external product
+          console.error('Failed to save product to local DB:', saveError?.message || saveError);
+
+          // If it's a duplicate key error, the product already exists - fetch it
+          if (saveError?.code === 'P2002') {
+            const existingProduct = await prisma.product.findUnique({
+              where: { barcode: externalProduct.barcode },
+              include: { images: true }
+            });
+            if (existingProduct) {
+              return res.json({
+                product: existingProduct,
+                savedNew: false
+              });
+            }
+          }
+
+          return res.json({
+            product: {
+              ...externalProduct,
+              id: 'new',
+              isExternal: true
+            },
+            savedNew: false
+          });
+        }
+      }
+      console.log(`[Scan] Product not found in any database`);
+      throw new AppError('Product not found locally or in external database', 404);
+    }
+
+    console.log(`[Scan] Found local product: ${product.name}`);
+
+    // Build inventory query - only add storeId if it's provided and valid
+    const inventoryQuery: { productId: string; storeId?: string } = { productId: product.id };
+    if (storeId) {
+      inventoryQuery.storeId = storeId;
+    }
+
+    let inventory;
+    try {
+      inventory = await prisma.inventory.findFirst({
+        where: inventoryQuery,
+        include: { location: true },
+      });
+    } catch (dbError) {
+      console.error('Database error looking up inventory:', dbError);
+      throw new AppError('Database error while looking up inventory', 500);
+    }
 
     res.json({ product, inventory });
   } catch (error) {

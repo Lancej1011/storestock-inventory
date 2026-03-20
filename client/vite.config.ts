@@ -5,15 +5,11 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '');
 
   return {
-    build: {
-      rollupOptions: {
-        external: [
-          '@tensorflow-models/coco-ssd',
-        ],
-      },
-    },
+    plugins: [react()],
     server: {
       port: 5174,
+      host: true,
+      allowedHosts: true,
       proxy: {
         '/api': {
           target: 'http://localhost:3000',
@@ -25,7 +21,6 @@ export default defineConfig(({ mode }) => {
         },
       },
     },
-    // In production, use relative API path for proxy or absolute URL
     base: env.VITE_API_URL === '/api' && mode === 'production' 
       ? '/' 
       : '/',

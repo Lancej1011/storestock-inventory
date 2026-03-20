@@ -189,4 +189,53 @@ router.delete('/:id', authenticate, authorize('ADMIN'), async (req: Request, res
   }
 });
 
+// Upload product image from snapshot
+router.post('/image', authenticate, authorize('ADMIN', 'MANAGER', 'EMPLOYEE'), async (req: Request, res: Response, next) => {
+  try {
+    const { productId, barcode, image } = req.body;
+
+    if (!image) {
+      throw new AppError('No image data provided', 400);
+    }
+
+    // For now, store as base64 data URL (in production, upload to S3/GCS)
+    const imageUrl = `data:image/jpeg;base64,${image}`;
+
+    // Update product's primary image
+    if (productId) {
+      // Check if product already has images
+      const existingImages = await prisma.productImage.findMany({
+        where: { productId }
+      });
+
+      if (existingImages.length > 0) {
+        // Update existing primary image
+        await prisma.productImage.updateMany({
+          where: { productId, isPrimary: true },
+          data: { imageUrl }
+        });
+      } else {
+        // Create new primary image
+        await prisma.productImage.create({
+          data: {
+            productId,
+            imageUrl,
+            isPrimary: true
+          }
+        });
+      }
+
+      // Also update the product's imageUrl field
+      await prisma.product.update({
+        where: { id: productId },
+        data: { imageUrl }
+      });
+    }
+
+    res.json({ success: true, imageUrl });
+  } catch (error) {
+    next(error);
+  }
+});
+
 export default router;
