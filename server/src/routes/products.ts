@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { PrismaClient } from '@prisma/client';
 import { authenticate, authorize } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
+import { enrichBarcode } from '../services/barcodeEnrichment.js';
 
 const router = Router();
 const prisma = new PrismaClient();
@@ -97,27 +98,80 @@ router.get('/:id', authenticate, async (req: Request, res: Response, next) => {
   }
 });
 
-// Get product by barcode
+// Get product by barcode — with automatic Open Food Facts / UPC Item DB fallback
 router.get('/barcode/:code', authenticate, async (req: Request, res: Response, next) => {
   try {
     const { code } = req.params;
-    const product = await prisma.product.findUnique({
-      where: { barcode: code },
-      include: {
-        category: true,
-        supplier: true,
-        images: { where: { isPrimary: true } },
-        inventory: {
-          include: { store: true, location: true },
-        },
+
+    const productInclude = {
+      category: true,
+      supplier: true,
+      images: { where: { isPrimary: true } },
+      inventory: {
+        include: { store: true, location: true },
       },
+    };
+
+    // 1. Check local DB first
+    const existing = await prisma.product.findUnique({
+      where: { barcode: code },
+      include: productInclude,
     });
 
-    if (!product) {
+    if (existing) {
+      return res.json(existing);
+    }
+
+    // 2. Not in local DB — query external enrichment APIs
+    const enriched = await enrichBarcode(code);
+
+    if (!enriched) {
       throw new AppError('Product not found', 404);
     }
 
-    res.json(product);
+    // 3. Auto-create the product so future scans hit the local DB
+    const sku = `AUTO-${code}`;
+
+    // Try to match category hint against existing categories in the DB
+    let categoryId: string | undefined;
+    if (enriched.categoryHint) {
+      const matchedCategory = await prisma.category.findFirst({
+        where: { name: { contains: enriched.categoryHint, mode: 'insensitive' }, isActive: true },
+      });
+      if (matchedCategory) categoryId = matchedCategory.id;
+    }
+
+    let autoProduct;
+    try {
+      autoProduct = await prisma.product.create({
+        data: {
+          barcode: code,
+          sku,
+          name: enriched.name,
+          description: enriched.description,
+          imageUrl: enriched.imageUrl,
+          categoryId,
+          costPrice: 0,
+          retailPrice: 0,
+        },
+        include: productInclude,
+      });
+    } catch {
+      // Race condition: another request may have just created it
+      const race = await prisma.product.findUnique({
+        where: { barcode: code },
+        include: productInclude,
+      });
+      if (!race) throw new AppError('Product not found', 404);
+      autoProduct = race;
+    }
+
+    // 4. Return with enrichment metadata so the client can show a confirmation banner
+    return res.json({
+      ...autoProduct,
+      autoPopulated: true,
+      dataSource: enriched.dataSource,
+    });
   } catch (error) {
     next(error);
   }

@@ -8,14 +8,23 @@ import { AppError } from '../middleware/errorHandler.js';
 const router = Router();
 const prisma = new PrismaClient();
 
+const aisleContextSchema = z.object({
+  aisleNumber: z.string(),
+  description: z.string().optional(),
+  categories: z.array(z.string()).optional().default([]),
+  recentItems: z.array(z.string()).optional().default([]),
+});
+
 const identifySchema = z.object({
   image: z.string().min(1),
   mimeType: z.string().optional().default('image/jpeg'),
+  ocrText: z.string().optional(),
+  aisleContext: aisleContextSchema.optional(),
 });
 
 router.post('/identify', authenticate, async (req: AuthRequest, res: Response, next) => {
   try {
-    const { image, mimeType } = identifySchema.parse(req.body);
+    const { image, mimeType, ocrText, aisleContext } = identifySchema.parse(req.body);
 
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) {
@@ -25,7 +34,26 @@ router.post('/identify', authenticate, async (req: AuthRequest, res: Response, n
     const genAI = new GoogleGenerativeAI(apiKey);
     const model = genAI.getGenerativeModel({ model: 'gemini-1.5-flash' });
 
-    const prompt = `You are a retail product identification assistant. Analyze this image and identify any product visible.
+    const ocrSection = ocrText?.trim()
+      ? `\n\nOCR text was extracted from the product label — use it to determine the exact variant, flavor, size, or weight:\n<ocr_label_text>\n${ocrText.trim()}\n</ocr_label_text>\nPrioritize OCR label text for variant/flavor/size disambiguation.`
+      : '';
+
+    let aisleSection = '';
+    if (aisleContext) {
+      const { aisleNumber, description, categories = [], recentItems = [] } = aisleContext;
+      const aisleLabel = description
+        ? `Aisle ${aisleNumber} — ${description}`
+        : `Aisle ${aisleNumber}`;
+      const catLine = categories.length > 0
+        ? `Common categories in this aisle: ${categories.join(', ')}.`
+        : '';
+      const recentLine = recentItems.length > 0
+        ? `Last ${recentItems.length} item${recentItems.length > 1 ? 's' : ''} scanned in this session: ${recentItems.join(', ')}.`
+        : '';
+      aisleSection = `\n\nScanning context: ${aisleLabel}. ${catLine} ${recentLine}\nUse this location context to narrow down which specific product variant this is likely to be.`.trimEnd();
+    }
+
+    const prompt = `You are a retail product identification assistant. Analyze this image and identify any product visible.${aisleSection}${ocrSection}
 
 Return ONLY a valid JSON object with these exact fields (no markdown, no explanation):
 {

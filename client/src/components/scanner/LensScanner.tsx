@@ -1,5 +1,13 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import api from '../../services/api';
+import { analyzeProductLabel, initializeOCR } from '../../utils/ocr';
+import {
+  loadEmbeddingModel,
+  createFingerprint,
+  findProductByEmbedding,
+  registerProduct,
+  type VisualEmbedding,
+} from '../../utils/productFingerprint';
 
 export interface IdentifiedProduct {
   brand: string | null;
@@ -22,19 +30,34 @@ export interface ProductMatch {
   category: { id: string; name: string } | null;
 }
 
+export interface AisleContext {
+  aisleNumber: string;
+  description?: string;
+  categories: string[];
+  recentItems: string[];
+}
+
 interface LensScannerProps {
   onProductFound: (product: ProductMatch) => void;
   onNoMatch: (identified: IdentifiedProduct) => void;
+  aisleContext?: AisleContext;
+  storeId?: string;
 }
 
-export function LensScanner({ onProductFound, onNoMatch }: LensScannerProps) {
+export function LensScanner({ onProductFound, onNoMatch, aisleContext, storeId }: LensScannerProps) {
   const [cameraActive, setCameraActive] = useState(false);
   const [identifying, setIdentifying] = useState(false);
+  const [ocrEnhancing, setOcrEnhancing] = useState(false);
+  const [ocrUsed, setOcrUsed] = useState(false);
+  const [visualHit, setVisualHit] = useState(false);
   const [capturedImage, setCapturedImage] = useState<string | null>(null);
   const [identified, setIdentified] = useState<IdentifiedProduct | null>(null);
   const [matches, setMatches] = useState<ProductMatch[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [flash, setFlash] = useState(false);
+
+  // Holds the MobileNet embedding from the most recent capture — saved to server on confirm
+  const pendingEmbeddingRef = useRef<VisualEmbedding | null>(null);
 
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -69,20 +92,43 @@ export function LensScanner({ onProductFound, onNoMatch }: LensScannerProps) {
   }, []);
 
   useEffect(() => {
+    // Pre-warm both workers so they're ready before first capture
+    initializeOCR().catch(() => {/* non-fatal */});
+    loadEmbeddingModel().catch(() => {/* non-fatal */});
     return () => stopCamera();
   }, [stopCamera]);
+
+  /** Called whenever the user confirms a product match — saves embedding to server. */
+  const confirmProduct = useCallback((product: ProductMatch) => {
+    const embedding = pendingEmbeddingRef.current;
+    if (embedding) {
+      registerProduct(product.id, embedding, product.name, product.barcode);
+      api.post('/embeddings', {
+        productId: product.id,
+        barcode: product.barcode,
+        name: product.name,
+        embedding,
+        storeId,
+      }).catch(() => {/* fire and forget */});
+      pendingEmbeddingRef.current = null;
+    }
+    onProductFound(product);
+  }, [onProductFound, storeId]);
 
   const capture = useCallback(async () => {
     if (!videoRef.current || identifying) return;
 
-    // Flash effect
     setFlash(true);
     setTimeout(() => setFlash(false), 150);
 
     setIdentifying(true);
+    setOcrEnhancing(false);
+    setOcrUsed(false);
+    setVisualHit(false);
     setIdentified(null);
     setMatches([]);
     setError(null);
+    pendingEmbeddingRef.current = null;
 
     const video = videoRef.current;
     const canvas = document.createElement('canvas');
@@ -96,32 +142,98 @@ export function LensScanner({ onProductFound, onNoMatch }: LensScannerProps) {
     stopCamera();
 
     const base64 = dataUrl.split(',')[1];
+    const fullBbox: [number, number, number, number] = [0, 0, canvas.width, canvas.height];
 
     try {
-      const response = await api.post('/scan/identify', {
-        image: base64,
-        mimeType: 'image/jpeg',
-      });
+      // ── Step 1: Generate MobileNet embedding + check registry (non-blocking) ──
+      let embeddingMatch: { productId: string; confidence: number } | null = null;
+      try {
+        const embedding = await Promise.race([
+          createFingerprint(canvas, fullBbox),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error('timeout')), 4000)),
+        ]) as VisualEmbedding;
+        pendingEmbeddingRef.current = embedding;
+        embeddingMatch = findProductByEmbedding(embedding, 0.6);
+      } catch {
+        // Model not loaded yet or took too long — skip embedding check this time
+      }
 
-      const { identified: id, matches: m } = response.data;
+      // ── Step 2: ≥ 90% visual match → skip Gemini entirely ──
+      if (embeddingMatch && embeddingMatch.confidence >= 0.9) {
+        try {
+          const productRes = await api.get(`/products/${embeddingMatch.productId}`);
+          const p: ProductMatch = productRes.data;
+          const fakeIdentified: IdentifiedProduct = {
+            brand: null, name: p.name, variant: null, category: null,
+            confidence: embeddingMatch.confidence, searchTerms: [],
+          };
+          setIdentified(fakeIdentified);
+          setMatches([p]);
+          setVisualHit(true);
+          setIdentifying(false);
+          confirmProduct(p);
+          return;
+        } catch {
+          // Product fetch failed — fall through to Gemini
+        }
+      }
+
+      // ── Step 3: Run Gemini + OCR in parallel ──
+      const [geminiResponse, ocrResult] = await Promise.all([
+        api.post('/scan/identify', { image: base64, mimeType: 'image/jpeg', aisleContext }),
+        analyzeProductLabel(canvas),
+      ]);
+
+      let { identified: id, matches: m } = geminiResponse.data;
+
+      // If a visual suggestion existed (60-89%), inject it as first candidate
+      // so the user sees it highlighted even as Gemini confirms/disagrees
+      if (embeddingMatch && embeddingMatch.confidence >= 0.6 && m.length === 0) {
+        try {
+          const suggestedRes = await api.get(`/products/${embeddingMatch.productId}`);
+          m = [suggestedRes.data, ...m];
+        } catch { /* non-fatal */ }
+      }
+
+      // ── Step 4: OCR enhancement if Gemini < 70% confident ──
+      const ocrText = ocrResult.rawText.trim();
+      if (id.confidence < 0.7 && ocrText.length > 15) {
+        setIdentifying(false);
+        setOcrEnhancing(true);
+        try {
+          const refined = await api.post('/scan/identify', {
+            image: base64, mimeType: 'image/jpeg', ocrText, aisleContext,
+          });
+          id = refined.data.identified;
+          m = refined.data.matches;
+          setOcrUsed(true);
+        } catch { /* fall through */ }
+        setOcrEnhancing(false);
+      }
+
       setIdentified(id);
       setMatches(m);
 
       if (m.length === 1) {
-        onProductFound(m[0]);
+        confirmProduct(m[0]);
       }
     } catch {
       setError('Could not identify product. Check your connection and try again.');
     } finally {
       setIdentifying(false);
+      setOcrEnhancing(false);
     }
-  }, [identifying, stopCamera, onProductFound]);
+  }, [identifying, stopCamera, confirmProduct, aisleContext]);
 
   const reset = () => {
     setCapturedImage(null);
     setIdentified(null);
     setMatches([]);
     setError(null);
+    setOcrUsed(false);
+    setOcrEnhancing(false);
+    setVisualHit(false);
+    pendingEmbeddingRef.current = null;
     startCamera();
   };
 
@@ -160,15 +272,15 @@ export function LensScanner({ onProductFound, onNoMatch }: LensScannerProps) {
           </>
         )}
 
-        {/* Identifying overlay */}
-        {identifying && (
+        {/* Identifying / OCR overlay */}
+        {(identifying || ocrEnhancing) && (
           <div className="absolute inset-0 bg-slate-950/70 backdrop-blur-sm flex flex-col items-center justify-center gap-4 z-10">
             <div className="relative">
-              <div className="w-16 h-16 border-4 border-indigo-500/30 rounded-full" />
-              <div className="absolute inset-0 w-16 h-16 border-4 border-indigo-500 border-t-transparent rounded-full animate-spin" />
+              <div className={`w-16 h-16 border-4 rounded-full ${ocrEnhancing ? 'border-amber-500/30' : 'border-indigo-500/30'}`} />
+              <div className={`absolute inset-0 w-16 h-16 border-4 border-t-transparent rounded-full animate-spin ${ocrEnhancing ? 'border-amber-500' : 'border-indigo-500'}`} />
             </div>
             <p className="text-[10px] font-black uppercase tracking-[0.25em] text-white animate-pulse">
-              Identifying Product...
+              {ocrEnhancing ? 'Enhancing with OCR...' : 'Identifying Product...'}
             </p>
           </div>
         )}
@@ -216,14 +328,26 @@ export function LensScanner({ onProductFound, onNoMatch }: LensScannerProps) {
       )}
 
       {/* Results */}
-      {identified && !identifying && (
+      {identified && !identifying && !ocrEnhancing && (
         <div className="premium-card p-6 space-y-5 animate-fade-in">
           {/* AI result header */}
           <div className="flex items-start justify-between gap-4">
             <div>
-              <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 mb-1.5">
-                AI Identified
-              </p>
+              <div className="flex items-center gap-2 mb-1.5 flex-wrap">
+                <p className="text-[10px] font-black uppercase tracking-widest text-slate-400">
+                  {visualHit ? 'Visual Match' : 'AI Identified'}
+                </p>
+                {visualHit && (
+                  <span className="px-2 py-0.5 rounded-full bg-indigo-100 dark:bg-indigo-500/15 text-indigo-700 dark:text-indigo-400 text-[9px] font-black uppercase tracking-wider">
+                    Instant · No API Call
+                  </span>
+                )}
+                {ocrUsed && (
+                  <span className="px-2 py-0.5 rounded-full bg-amber-100 dark:bg-amber-500/15 text-amber-700 dark:text-amber-400 text-[9px] font-black uppercase tracking-wider">
+                    OCR Enhanced
+                  </span>
+                )}
+              </div>
               <h3 className="text-xl font-black text-slate-900 dark:text-white leading-tight">
                 {[identified.brand, identified.name].filter(Boolean).join(' ') || 'Unknown Product'}
               </h3>
@@ -250,7 +374,7 @@ export function LensScanner({ onProductFound, onNoMatch }: LensScannerProps) {
               {matches.map((m) => (
                 <button
                   key={m.id}
-                  onClick={() => onProductFound(m)}
+                  onClick={() => confirmProduct(m)}
                   className="w-full flex items-center gap-4 p-4 rounded-xl bg-slate-50 dark:bg-slate-800/60 hover:bg-indigo-50 dark:hover:bg-indigo-900/20 border border-transparent hover:border-indigo-200 dark:hover:border-indigo-800 transition-all text-left group"
                 >
                   <div className="flex-1 min-w-0">
