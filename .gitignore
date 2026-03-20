@@ -39,3 +39,4 @@ server/prisma/migrations/
 *.tgz
 .cache/
 .claude/worktrees/
+server/inventory-*.json
