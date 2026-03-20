@@ -17,6 +17,7 @@ import locationRoutes from './routes/locations.js';
 import purchaseOrderRoutes from './routes/purchaseOrders.js';
 import reportRoutes from './routes/reports.js';
 import analyticsRoutes from './routes/analytics.js';
+import scanRoutes from './routes/scan.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { logger } from './utils/logger.js';
 
@@ -37,8 +38,8 @@ app.use(cors({
   origin: process.env.CLIENT_URL || 'http://localhost:5173',
   credentials: true,
 }));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Rate limiting
 const limiter = rateLimit({
@@ -68,6 +69,7 @@ app.use('/api/locations', locationRoutes);
 app.use('/api/purchase-orders', purchaseOrderRoutes);
 app.use('/api/reports', reportRoutes);
 app.use('/api/analytics', analyticsRoutes);
+app.use('/api/scan', scanRoutes);
 
 // Error handling
 app.use(errorHandler);
