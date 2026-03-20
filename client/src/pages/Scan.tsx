@@ -3,7 +3,8 @@ import { BrowserMultiFormatReader, NotFoundException } from '@zxing/library';
 import axios from 'axios';
 import api from '../services/api';
 import { useAuthStore } from '../store/authStore';
-import { LensScanner, ProductMatch, IdentifiedProduct } from '../components/scanner/LensScanner';
+import { LensScanner, ProductMatch, IdentifiedProduct, AisleContext } from '../components/scanner/LensScanner';
+import { registerProduct } from '../utils/productFingerprint';
 import { ShelfCounter } from '../components/scanner/ShelfCounter';
 import { ScanResults } from '../components/scanner/ScanResults';
 import { ProductForm } from '../components/scanner/ProductForm';
@@ -21,6 +22,8 @@ interface Product {
   retailPrice: string;
   category?: { id: string; name: string };
   images?: { id: string; imageUrl: string; isPrimary: boolean }[];
+  autoPopulated?: boolean;
+  dataSource?: 'openfoodfacts' | 'upcitemdb';
 }
 
 interface ScannedItem {
@@ -53,6 +56,14 @@ interface ShelfCountResult {
   cocoClass: string;
 }
 
+interface AisleLayout {
+  id: string;
+  aisleNumber: string;
+  description?: string;
+  categories: string[];
+  dominantProducts: string[];
+}
+
 export default function Scan() {
   const { user } = useAuthStore();
   const [mode, setMode] = useState<ScanMode>('lens');
@@ -73,6 +84,7 @@ export default function Scan() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<string | null>(null);
+  const [autoPopulated, setAutoPopulated] = useState<{ source: 'openfoodfacts' | 'upcitemdb' } | null>(null);
 
   // Barcode mode state
   const [scanning, setScanning] = useState(false);
@@ -88,6 +100,11 @@ export default function Scan() {
   // Shelf counter state
   const [shelfResults, setShelfResults] = useState<ShelfCountResult[]>([]);
 
+  // Aisle / location context state
+  const [aisleLayouts, setAisleLayouts] = useState<AisleLayout[]>([]);
+  const [selectedAisleId, setSelectedAisleId] = useState<string>('');
+  const [recentScanNames, setRecentScanNames] = useState<string[]>([]);
+
   useEffect(() => {
     if (user?.store) setSelectedStoreId(user.store.id);
     fetchStores();
@@ -96,7 +113,10 @@ export default function Scan() {
   useEffect(() => {
     if (selectedStoreId) {
       fetchLocations(selectedStoreId);
+      fetchAisles(selectedStoreId);
+      syncEmbeddings(selectedStoreId);
       setSelectedLocationId('');
+      setSelectedAisleId('');
     }
   }, [selectedStoreId]);
 
@@ -127,6 +147,31 @@ export default function Scan() {
     }
   };
 
+  const fetchAisles = async (storeId: string) => {
+    try {
+      const response = await api.get(`/aisles/store/${storeId}`);
+      setAisleLayouts(response.data);
+    } catch {
+      setAisleLayouts([]);
+    }
+  };
+
+  const syncEmbeddings = async (storeId: string) => {
+    try {
+      const response = await api.get(`/embeddings/store/${storeId}`);
+      const { embeddings } = response.data as {
+        embeddings: Array<{ productId: string; barcode: string; name: string; embedding: object }>;
+      };
+      if (embeddings?.length) {
+        for (const e of embeddings) {
+          registerProduct(e.productId, e.embedding as Parameters<typeof registerProduct>[1], e.name, e.barcode);
+        }
+      }
+    } catch {
+      // Non-fatal — embedding-based matching just won't work this session
+    }
+  };
+
   const resetProductState = () => {
     setProduct(null);
     setInventory(null);
@@ -134,12 +179,14 @@ export default function Scan() {
     setStockInSuccess(false);
     setShowAddProduct(false);
     setError(null);
+    setAutoPopulated(null);
     setNewProduct({ name: '', sku: '', costPrice: '', retailPrice: '', description: '' });
     setQuantity(1);
     setSelectedLocationId('');
     setScannedItems([]);
     setContinuousMode(false);
     setShelfResults([]);
+    // Keep recentScanNames and selectedAisleId — they persist across scans within a session
   };
 
   const switchMode = (m: ScanMode) => {
@@ -155,6 +202,11 @@ export default function Scan() {
     const storeInventory = (p as unknown as Product & { inventory?: Inventory[] })
       .inventory?.find((inv) => inv.store.id === selectedStoreId);
     setInventory(storeInventory ?? null);
+    // Track for location context — keep last 3 unique names
+    setRecentScanNames((prev) => {
+      const updated = [p.name, ...prev.filter((n) => n !== p.name)];
+      return updated.slice(0, 3);
+    });
   };
 
   const handleLensNoMatch = (identified: IdentifiedProduct) => {
@@ -266,12 +318,13 @@ export default function Scan() {
   const lookupProduct = async (barcode: string) => {
     setLoading(true);
     setError(null);
+    setAutoPopulated(null);
     try {
       const response = await api.get(`/products/barcode/${encodeURIComponent(barcode)}`);
       const data = response.data;
 
       if (data.isExternalResult) {
-        // Found via external barcode API — not yet in our database.
+        // Found via external barcode lookup API — not yet in our database.
         // Pre-populate the add-product form with what we know.
         const name = [data.brand, data.name].filter(Boolean).join(' ') || data.name || '';
         setNewProduct((prev) => ({
@@ -282,8 +335,11 @@ export default function Scan() {
         setResult(barcode);
         setShowAddProduct(true);
       } else {
-        // Already in our database
-        setProduct(data);
+        // Product is in our database (may have been auto-created by enrichment)
+        setProduct(data as Product);
+        if ((data as Product).autoPopulated && (data as Product).dataSource) {
+          setAutoPopulated({ source: (data as Product).dataSource! });
+        }
         const storeInventory = data.inventory?.find(
           (inv: { store: { id: string } }) => inv.store.id === selectedStoreId
         );
@@ -427,13 +483,56 @@ export default function Scan() {
           ))}
         </div>
 
-        {/* ── AI Lens Mode ── */}
-        {mode === 'lens' && !product && !showAddProduct && (
-          <LensScanner
-            onProductFound={handleLensProductFound}
-            onNoMatch={handleLensNoMatch}
-          />
+        {/* ── Aisle selector (lens mode, when layouts exist) ── */}
+        {mode === 'lens' && aisleLayouts.length > 0 && (
+          <div className="flex items-center gap-3">
+            <span className="text-[10px] font-black uppercase tracking-widest text-slate-400 shrink-0">Scanning</span>
+            <select
+              value={selectedAisleId}
+              onChange={(e) => setSelectedAisleId(e.target.value)}
+              className="flex-1 input-premium py-2 text-sm font-semibold"
+            >
+              <option value="">— Any aisle —</option>
+              {aisleLayouts.map((a) => (
+                <option key={a.id} value={a.id}>
+                  Aisle {a.aisleNumber}{a.description ? ` — ${a.description}` : ''}
+                </option>
+              ))}
+            </select>
+            {recentScanNames.length > 0 && (
+              <button
+                onClick={() => setRecentScanNames([])}
+                className="text-[9px] font-black uppercase tracking-widest text-slate-400 hover:text-red-400 transition-colors shrink-0"
+                title="Clear recent scan history"
+              >
+                Clear
+              </button>
+            )}
+          </div>
         )}
+
+        {/* ── AI Lens Mode ── */}
+        {mode === 'lens' && !product && !showAddProduct && (() => {
+          const selectedAisle = aisleLayouts.find((a) => a.id === selectedAisleId);
+          const aisleContext: AisleContext | undefined = selectedAisle
+            ? {
+                aisleNumber: selectedAisle.aisleNumber,
+                description: selectedAisle.description,
+                categories: selectedAisle.categories,
+                recentItems: recentScanNames,
+              }
+            : recentScanNames.length > 0
+            ? { aisleNumber: '', categories: [], recentItems: recentScanNames }
+            : undefined;
+          return (
+            <LensScanner
+              onProductFound={handleLensProductFound}
+              onNoMatch={handleLensNoMatch}
+              aisleContext={aisleContext}
+              storeId={selectedStoreId}
+            />
+          );
+        })()}
 
         {/* ── Shelf Counter Mode ── */}
         {mode === 'shelf' && shelfResults.length === 0 && (
@@ -602,6 +701,32 @@ export default function Scan() {
             onAddAll={addAllToInventory}
             loading={loading}
           />
+        )}
+
+        {/* ── Auto-populated product banner ── */}
+        {!loading && product && autoPopulated && (
+          <div className="bg-amber-50 dark:bg-amber-500/10 border border-amber-200 dark:border-amber-500/25 p-4 rounded-2xl flex items-start gap-3 animate-fade-in">
+            <svg className="w-5 h-5 text-amber-500 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
+            </svg>
+            <div className="flex-1 min-w-0">
+              <p className="text-[10px] font-black uppercase tracking-widest text-amber-600 dark:text-amber-400 mb-0.5">
+                Auto-populated · {autoPopulated.source === 'openfoodfacts' ? 'Open Food Facts' : 'UPC Item DB'}
+              </p>
+              <p className="text-sm font-semibold text-amber-800 dark:text-amber-200">
+                This product was found online and added to your database. Please verify the name and pricing before adding stock.
+              </p>
+            </div>
+            <button
+              onClick={() => setAutoPopulated(null)}
+              className="text-amber-400 hover:text-amber-600 transition-colors shrink-0"
+              aria-label="Dismiss"
+            >
+              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                <path strokeLinecap="round" strokeLinejoin="round" d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
         )}
 
         {/* ── Product found → stock update form ── */}

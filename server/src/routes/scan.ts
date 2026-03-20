@@ -75,16 +75,27 @@ async function findInventoryMatches(identified: IdentifiedProduct) {
   });
 }
 
-// ─── POST /identify ───────────────────────────────────────────────────────────
+// ─── Schemas ──────────────────────────────────────────────────────────────────
+
+const aisleContextSchema = z.object({
+  aisleNumber: z.string(),
+  description: z.string().optional(),
+  categories: z.array(z.string()).optional().default([]),
+  recentItems: z.array(z.string()).optional().default([]),
+});
 
 const identifySchema = z.object({
-  image:    z.string().min(1),
-  mimeType: z.string().optional().default('image/jpeg'),
+  image:       z.string().min(1),
+  mimeType:    z.string().optional().default('image/jpeg'),
+  ocrText:     z.string().optional(),
+  aisleContext: aisleContextSchema.optional(),
 });
+
+// ─── POST /identify ───────────────────────────────────────────────────────────
 
 router.post('/identify', authenticate, async (req: AuthRequest, res: Response, next) => {
   try {
-    const { image, mimeType } = identifySchema.parse(req.body);
+    const { image, mimeType, ocrText, aisleContext } = identifySchema.parse(req.body);
 
     const apiKey = process.env.GEMINI_API_KEY;
     if (!apiKey) throw new AppError('Gemini API key not configured', 500);
@@ -95,26 +106,45 @@ router.post('/identify', authenticate, async (req: AuthRequest, res: Response, n
     // Inject past corrections as training context
     const feedbackContext = await getRecentFeedbackContext();
 
-    const prompt = `You are a retail product identification assistant. Analyze this image and identify ALL distinct products visible.
+    // Build OCR section if provided
+    const ocrSection = ocrText?.trim()
+      ? `\n\nOCR text was extracted from the product label — use it to determine the exact variant, flavor, size, or weight:\n<ocr_label_text>\n${ocrText.trim()}\n</ocr_label_text>\nPrioritize OCR label text for variant/flavor/size disambiguation.`
+      : '';
 
-Return ONLY a valid JSON array — one element per distinct product type (no markdown, no explanation):
-[
-  {
-    "brand": "brand or manufacturer name, or null if unclear",
-    "name": "product name, or null if unclear",
-    "variant": "size, flavor, or variant like '500ml' or 'Original', or null",
-    "category": "one of: beverage, snack, cleaning, personal_care, food, electronics, household, other, or null",
-    "confidence": 0.85,
-    "quantity": 1,
-    "searchTerms": ["keyword1", "keyword2", "keyword3"]
-  }
-]
+    // Build aisle context section if provided
+    let aisleSection = '';
+    if (aisleContext) {
+      const { aisleNumber, description, categories = [], recentItems = [] } = aisleContext;
+      const aisleLabel = description
+        ? `Aisle ${aisleNumber} — ${description}`
+        : `Aisle ${aisleNumber}`;
+      const catLine = categories.length > 0
+        ? `Common categories in this aisle: ${categories.join(', ')}.`
+        : '';
+      const recentLine = recentItems.length > 0
+        ? `Last ${recentItems.length} item${recentItems.length > 1 ? 's' : ''} scanned in this session: ${recentItems.join(', ')}.`
+        : '';
+      aisleSection = `\n\nScanning context: ${aisleLabel}. ${catLine} ${recentLine}\nUse this location context to narrow down which specific product variant this is likely to be.`.trimEnd();
+    }
+
+    const prompt = `You are a retail product identification assistant. Analyze this image and identify the primary product visible.${aisleSection}${ocrSection}
+
+Return ONLY a valid JSON object (no markdown, no explanation):
+{
+  "brand": "brand or manufacturer name, or null if unclear",
+  "name": "product name, or null if unclear",
+  "variant": "size, flavor, or variant like '500ml' or 'Original', or null",
+  "category": "one of: beverage, snack, cleaning, personal_care, food, electronics, household, other, or null",
+  "confidence": 0.85,
+  "quantity": 1,
+  "searchTerms": ["keyword1", "keyword2", "keyword3"]
+}
 
 Rules:
-- List each DISTINCT product type once — e.g. if there are 2 bags of Doritos and 1 bag of Lays, return 2 elements
+- Focus on the most prominent / foreground product
 - Set "quantity" to how many units of that product are visible
 - searchTerms should be 2-5 keywords a person would use to find the product in an inventory database
-- If you cannot identify any products, return an empty array []
+- If you cannot identify any product, return confidence 0 with null fields
 - Pay close attention to variant details (flavor, size, colour) — past corrections show these are commonly confused${feedbackContext}`;
 
     let text: string;
@@ -129,25 +159,21 @@ Rules:
       throw new AppError(`AI service error: ${geminiError?.message || 'Unknown error'}`, 502);
     }
 
-    let identifiedProducts: IdentifiedProduct[];
+    let identified: IdentifiedProduct;
     try {
       const cleaned = text.replace(/```json\n?|\n?```/g, '').trim();
       const parsed  = JSON.parse(cleaned);
-      identifiedProducts = Array.isArray(parsed) ? parsed : [parsed];
+      // Accept both single-object and array responses (array: take first element)
+      identified = Array.isArray(parsed) ? parsed[0] : parsed;
     } catch {
       console.error('Failed to parse Gemini response:', text);
       throw new AppError('Failed to parse AI response', 500);
     }
 
-    // Search inventory for every detected product in parallel
-    const results = await Promise.all(
-      identifiedProducts.map(async (identified) => ({
-        identified,
-        matches: await findInventoryMatches(identified),
-      }))
-    );
+    // Search inventory for the identified product
+    const matches = await findInventoryMatches(identified);
 
-    res.json({ results });
+    res.json({ identified, matches });
   } catch (error) {
     next(error);
   }

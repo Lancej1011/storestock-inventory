@@ -3,6 +3,7 @@ import { z } from 'zod';
 import { PrismaClient } from '@prisma/client';
 import { authenticate, authorize } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
+import { enrichBarcode } from '../services/barcodeEnrichment.js';
 
 const router = Router();
 const prisma = new PrismaClient();
@@ -97,29 +98,81 @@ router.get('/:id', authenticate, async (req: Request, res: Response, next) => {
   }
 });
 
-// Get product by barcode — checks local DB first, falls back to external barcode lookup API
+// Get product by barcode — checks local DB first, then enrichBarcode() (auto-creates),
+// then falls back to external BARCODE_LOOKUP_API_KEY if configured (isExternalResult).
 router.get('/barcode/:code', authenticate, async (req: Request, res: Response, next) => {
   try {
     const { code } = req.params;
 
-    // 1. Check local database first
-    const product = await prisma.product.findUnique({
-      where: { barcode: code },
-      include: {
-        category: true,
-        supplier: true,
-        images: { where: { isPrimary: true } },
-        inventory: {
-          include: { store: true, location: true },
-        },
+    const productInclude = {
+      category: true,
+      supplier: true,
+      images: { where: { isPrimary: true } },
+      inventory: {
+        include: { store: true, location: true },
       },
+    };
+
+    // 1. Check local DB first
+    const existing = await prisma.product.findUnique({
+      where: { barcode: code },
+      include: productInclude,
     });
 
-    if (product) {
-      return res.json(product);
+    if (existing) {
+      return res.json(existing);
     }
 
-    // 2. Not in DB — try external barcode lookup API
+    // 2. Not in local DB — try enrichBarcode() (Open Food Facts / UPC Item DB)
+    const enriched = await enrichBarcode(code);
+
+    if (enriched) {
+      // Auto-create the product so future scans hit the local DB
+      const sku = `AUTO-${code}`;
+
+      // Try to match category hint against existing categories in the DB
+      let categoryId: string | undefined;
+      if (enriched.categoryHint) {
+        const matchedCategory = await prisma.category.findFirst({
+          where: { name: { contains: enriched.categoryHint, mode: 'insensitive' }, isActive: true },
+        });
+        if (matchedCategory) categoryId = matchedCategory.id;
+      }
+
+      let autoProduct;
+      try {
+        autoProduct = await prisma.product.create({
+          data: {
+            barcode: code,
+            sku,
+            name: enriched.name,
+            description: enriched.description,
+            imageUrl: enriched.imageUrl,
+            categoryId,
+            costPrice: 0,
+            retailPrice: 0,
+          },
+          include: productInclude,
+        });
+      } catch {
+        // Race condition: another request may have just created it
+        const race = await prisma.product.findUnique({
+          where: { barcode: code },
+          include: productInclude,
+        });
+        if (!race) throw new AppError('Product not found', 404);
+        autoProduct = race;
+      }
+
+      // Return with enrichment metadata so the client can show a confirmation banner
+      return res.json({
+        ...autoProduct,
+        autoPopulated: true,
+        dataSource: enriched.dataSource,
+      });
+    }
+
+    // 3. enrichBarcode returned nothing — try BARCODE_LOOKUP_API_KEY as last resort
     const apiKey = process.env.BARCODE_LOOKUP_API_KEY;
     if (apiKey) {
       try {
@@ -132,7 +185,7 @@ router.get('/barcode/:code', authenticate, async (req: Request, res: Response, n
           const p = data.products?.[0];
 
           if (p) {
-            // Return external result pre-formatted for the client — not yet in DB
+            // Return external result pre-formatted for the client — not yet saved to DB
             return res.status(200).json({
               isExternalResult: true,
               barcode: code,
@@ -152,7 +205,7 @@ router.get('/barcode/:code', authenticate, async (req: Request, res: Response, n
       }
     }
 
-    // 3. Genuinely unknown barcode
+    // 4. Genuinely unknown barcode
     throw new AppError('Product not found', 404);
   } catch (error) {
     next(error);
