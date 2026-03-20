@@ -20,6 +20,7 @@ import analyticsRoutes from './routes/analytics.js';
 import visionRoutes from './routes/vision.js';
 import embeddingsRoutes from './routes/embeddings.js';
 import aislesRoutes from './routes/aisles.js';
+import scanRoutes from './routes/scan.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { logger } from './utils/logger.js';
 
@@ -40,8 +41,8 @@ app.use(cors({
   origin: process.env.CLIENT_URL || 'http://localhost:5173',
   credentials: true,
 }));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Rate limiting
 const limiter = rateLimit({
@@ -74,6 +75,7 @@ app.use('/api/analytics', analyticsRoutes);
 app.use('/api/vision', visionRoutes);
 app.use('/api/embeddings', embeddingsRoutes);
 app.use('/api/aisles', aislesRoutes);
+app.use('/api/scan', scanRoutes);
 
 // Error handling
 app.use(errorHandler);
