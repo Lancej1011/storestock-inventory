@@ -1,5 +1,5 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
-import { loadShelfModel, detectProducts, DetectedObject } from '../../utils/shelfScanner';
+import { loadDetectionModel, detectProducts, DetectedObject } from '../../utils/shelfScanner';
 import api from '../../services/api';
 
 interface IdentifiedClass {
@@ -143,7 +143,7 @@ export function ShelfCounter({ onCountConfirmed }: ShelfCounterProps) {
         videoRef.current.srcObject = stream;
         await videoRef.current.play();
       }
-      await loadShelfModel();
+      await loadDetectionModel();
       setCameraActive(true);
       isRunning.current = true;
       detectionLoopRef.current = window.setTimeout(runDetection, 200);

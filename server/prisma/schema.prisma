@@ -54,6 +54,7 @@ model User {
   stockTransactions StockTransaction[]
   auditLogs         AuditLog[]
   purchaseOrders    PurchaseOrder[]
+  scanFeedback      ScanFeedback[]
 
   @@map("users")
 }
@@ -303,6 +304,23 @@ model ProductEmbedding {
   lastUpdated DateTime @default(now()) @map("last_updated")
 
   @@map("product_embeddings")
+}
+
+model ScanFeedback {
+  id              String   @id @default(uuid())
+  userId          String   @map("user_id")
+  user            User     @relation(fields: [userId], references: [id])
+  productId       String?  @map("product_id")
+  imageThumb      String   @map("image_thumb")   // small compressed base64 thumbnail
+  geminiResult    Json     @map("gemini_result")  // what AI originally returned
+  correctedResult Json     @map("corrected_result") // what user confirmed / fixed
+  wasCorrect      Boolean  @map("was_correct")    // did Gemini get it right first try?
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  @@index([userId])
+  @@index([productId])
+  @@index([createdAt])
+  @@map("scan_feedback")
 }
 
 model AisleLayout {

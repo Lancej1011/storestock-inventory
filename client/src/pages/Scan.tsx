@@ -80,6 +80,10 @@ export default function Scan() {
   const [scannedItems, setScannedItems] = useState<ScannedItem[]>([]);
   const videoRef = useRef<HTMLVideoElement>(null);
   const readerRef = useRef<BrowserMultiFormatReader | null>(null);
+  const processingRef = useRef(false);                    // prevents duplicate reads in single-scan mode
+  const lastScannedRef = useRef<string>('');              // debounce for continuous mode
+  const lastScannedTimeRef = useRef<number>(0);           // debounce timestamp
+  const notFoundBarcodesRef = useRef<Set<string>>(new Set()); // barcodes confirmed not in DB — skip retrying
 
   // Shelf counter state
   const [shelfResults, setShelfResults] = useState<ShelfCountResult[]>([]);
@@ -166,6 +170,10 @@ export default function Scan() {
 
   const startBarcodeScanning = async (continuous: boolean = false) => {
     resetProductState();
+    processingRef.current = false;
+    lastScannedRef.current = '';
+    lastScannedTimeRef.current = 0;
+    notFoundBarcodesRef.current = new Set();
     setScanning(true);
     setContinuousMode(continuous);
 
@@ -186,8 +194,18 @@ export default function Scan() {
           if (scanResult) {
             const barcode = scanResult.getText();
             if (continuous) {
+              // Skip barcodes already confirmed as not in the database
+              if (notFoundBarcodesRef.current.has(barcode)) return;
+              // Debounce: ignore the same barcode within 1.5 s to avoid double-counts
+              const now = Date.now();
+              if (barcode === lastScannedRef.current && now - lastScannedTimeRef.current < 1500) return;
+              lastScannedRef.current = barcode;
+              lastScannedTimeRef.current = now;
               await handleContinuousScan(barcode);
             } else {
+              // Single scan: only process once, then stop
+              if (processingRef.current) return;
+              processingRef.current = true;
               setResult(barcode);
               await lookupProduct(barcode);
               stopBarcodeScanning();
@@ -221,8 +239,14 @@ export default function Scan() {
         setScannedItems((prev) => [...prev, { product: response.data, count: 1 }]);
       }
       playBeep();
-    } catch {
-      console.log('Product not found:', barcode);
+    } catch (err: any) {
+      if (err?.response?.status === 404) {
+        // Product not in database — don't waste requests retrying it
+        notFoundBarcodesRef.current.add(barcode);
+        console.log('Barcode not in inventory, skipping further attempts:', barcode);
+      } else {
+        console.log('Scan error for barcode:', barcode, err?.message);
+      }
     }
   };
 
@@ -244,13 +268,30 @@ export default function Scan() {
     setError(null);
     try {
       const response = await api.get(`/products/barcode/${encodeURIComponent(barcode)}`);
-      setProduct(response.data);
-      const storeInventory = response.data.inventory?.find(
-        (inv: { store: { id: string } }) => inv.store.id === selectedStoreId
-      );
-      setInventory(storeInventory ?? null);
+      const data = response.data;
+
+      if (data.isExternalResult) {
+        // Found via external barcode API — not yet in our database.
+        // Pre-populate the add-product form with what we know.
+        const name = [data.brand, data.name].filter(Boolean).join(' ') || data.name || '';
+        setNewProduct((prev) => ({
+          ...prev,
+          name,
+          description: data.description || '',
+        }));
+        setResult(barcode);
+        setShowAddProduct(true);
+      } else {
+        // Already in our database
+        setProduct(data);
+        const storeInventory = data.inventory?.find(
+          (inv: { store: { id: string } }) => inv.store.id === selectedStoreId
+        );
+        setInventory(storeInventory ?? null);
+      }
     } catch (err) {
       if (axios.isAxiosError(err) && err.response?.status === 404) {
+        // Genuinely unknown barcode — show blank add form
         setShowAddProduct(true);
       } else {
         setError('Failed to lookup product');
@@ -551,7 +592,7 @@ export default function Scan() {
           </div>
         )}
 
-        {/* ── Barcode scan results (continuous) ── */}
+        {/* ── Barcode scan results (continuous/batch mode) ── */}
         {mode === 'barcode' && (
           <ScanResults
             product={product}
@@ -560,9 +601,6 @@ export default function Scan() {
             onClear={() => { setScannedItems([]); setContinuousMode(false); }}
             onAddAll={addAllToInventory}
             loading={loading}
-            visualPredictions={[]}
-            ocrResult={null}
-            smartSearchMode={false}
           />
         )}
 

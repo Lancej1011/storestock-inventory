@@ -1,12 +1,15 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import api from '../../services/api';
 
+// ─── Types ────────────────────────────────────────────────────────────────────
+
 export interface IdentifiedProduct {
   brand: string | null;
   name: string | null;
   variant: string | null;
   category: string | null;
   confidence: number;
+  quantity: number;
   searchTerms: string[];
 }
 
@@ -22,32 +25,44 @@ export interface ProductMatch {
   category: { id: string; name: string } | null;
 }
 
+export interface ScanResult {
+  identified: IdentifiedProduct;
+  matches: ProductMatch[];
+}
+
 interface LensScannerProps {
   onProductFound: (product: ProductMatch) => void;
   onNoMatch: (identified: IdentifiedProduct) => void;
 }
 
-export function LensScanner({ onProductFound, onNoMatch }: LensScannerProps) {
-  const [cameraActive, setCameraActive] = useState(false);
-  const [identifying, setIdentifying] = useState(false);
-  const [capturedImage, setCapturedImage] = useState<string | null>(null);
-  const [identified, setIdentified] = useState<IdentifiedProduct | null>(null);
-  const [matches, setMatches] = useState<ProductMatch[]>([]);
-  const [error, setError] = useState<string | null>(null);
-  const [flash, setFlash] = useState(false);
+const CATEGORIES = ['beverage','snack','cleaning','personal_care','food','electronics','household','other'];
 
-  const videoRef = useRef<HTMLVideoElement>(null);
+// ─── Component ────────────────────────────────────────────────────────────────
+
+export function LensScanner({ onProductFound, onNoMatch }: LensScannerProps) {
+  const [cameraActive, setCameraActive]   = useState(false);
+  const [identifying, setIdentifying]     = useState(false);
+  const [capturedImage, setCapturedImage] = useState<string | null>(null);
+  const [imageThumb, setImageThumb]       = useState<string | null>(null);
+  const [results, setResults]             = useState<ScanResult[]>([]);
+  const [error, setError]                 = useState<string | null>(null);
+  const [flash, setFlash]                 = useState(false);
+
+  // Track per-card feedback state: 'idle' | 'confirmed' | 'correcting' | 'saved'
+  const [feedbackState, setFeedbackState] = useState<Record<number, 'idle'|'confirmed'|'correcting'|'saved'>>({});
+  // Editable correction values per card index
+  const [corrections, setCorrections]     = useState<Record<number, Partial<IdentifiedProduct>>>({});
+
+  const videoRef  = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
+
+  // ── Camera ────────────────────────────────────────────────────────────────
 
   const startCamera = async () => {
     setError(null);
     try {
       const stream = await navigator.mediaDevices.getUserMedia({
-        video: {
-          facingMode: 'environment',
-          width: { ideal: 1280 },
-          height: { ideal: 720 },
-        },
+        video: { facingMode: 'environment', width: { ideal: 1280 }, height: { ideal: 720 } },
       });
       streamRef.current = stream;
       if (videoRef.current) {
@@ -68,47 +83,49 @@ export function LensScanner({ onProductFound, onNoMatch }: LensScannerProps) {
     setCameraActive(false);
   }, []);
 
-  useEffect(() => {
-    return () => stopCamera();
-  }, [stopCamera]);
+  useEffect(() => () => stopCamera(), [stopCamera]);
+
+  // ── Capture & identify ────────────────────────────────────────────────────
 
   const capture = useCallback(async () => {
     if (!videoRef.current || identifying) return;
 
-    // Flash effect
     setFlash(true);
     setTimeout(() => setFlash(false), 150);
-
     setIdentifying(true);
-    setIdentified(null);
-    setMatches([]);
+    setResults([]);
+    setFeedbackState({});
+    setCorrections({});
     setError(null);
 
-    const video = videoRef.current;
+    const video  = videoRef.current;
     const canvas = document.createElement('canvas');
-    canvas.width = video.videoWidth;
+    canvas.width  = video.videoWidth;
     canvas.height = video.videoHeight;
-    const ctx = canvas.getContext('2d')!;
-    ctx.drawImage(video, 0, 0);
-
+    canvas.getContext('2d')!.drawImage(video, 0, 0);
     const dataUrl = canvas.toDataURL('image/jpeg', 0.82);
     setCapturedImage(dataUrl);
     stopCamera();
 
-    const base64 = dataUrl.split(',')[1];
+    // Generate small thumbnail for feedback storage
+    const thumbCanvas = document.createElement('canvas');
+    thumbCanvas.width  = 160;
+    thumbCanvas.height = 120;
+    thumbCanvas.getContext('2d')!.drawImage(video, 0, 0, 160, 120);
+    const thumb = thumbCanvas.toDataURL('image/jpeg', 0.5);
+    setImageThumb(thumb);
 
     try {
       const response = await api.post('/scan/identify', {
-        image: base64,
+        image:    dataUrl.split(',')[1],
         mimeType: 'image/jpeg',
       });
+      const { results: r } = response.data;
+      setResults(r ?? []);
 
-      const { identified: id, matches: m } = response.data;
-      setIdentified(id);
-      setMatches(m);
-
-      if (m.length === 1) {
-        onProductFound(m[0]);
+      // Auto-select if single product with one exact inventory match
+      if (r?.length === 1 && r[0].matches.length === 1) {
+        onProductFound(r[0].matches[0]);
       }
     } catch {
       setError('Could not identify product. Check your connection and try again.');
@@ -119,11 +136,59 @@ export function LensScanner({ onProductFound, onNoMatch }: LensScannerProps) {
 
   const reset = () => {
     setCapturedImage(null);
-    setIdentified(null);
-    setMatches([]);
+    setImageThumb(null);
+    setResults([]);
+    setFeedbackState({});
+    setCorrections({});
     setError(null);
     startCamera();
   };
+
+  // ── Feedback helpers ──────────────────────────────────────────────────────
+
+  const sendFeedback = async (
+    idx: number,
+    original: IdentifiedProduct,
+    corrected: IdentifiedProduct,
+    wasCorrect: boolean,
+    productId?: string,
+  ) => {
+    try {
+      await api.post('/scan/feedback', {
+        imageThumb:      imageThumb?.split(',')[1] ?? '',
+        geminiResult:    original,
+        correctedResult: corrected,
+        wasCorrect,
+        productId,
+      });
+      setFeedbackState((p) => ({ ...p, [idx]: 'saved' }));
+    } catch {
+      // Fail silently — don't block the user
+      setFeedbackState((p) => ({ ...p, [idx]: 'saved' }));
+    }
+  };
+
+  const handleConfirm = (idx: number, result: ScanResult) => {
+    setFeedbackState((p) => ({ ...p, [idx]: 'confirmed' }));
+    const matched = result.matches[0];
+    sendFeedback(idx, result.identified, result.identified, true, matched?.id);
+  };
+
+  const handleStartCorrect = (idx: number, result: ScanResult) => {
+    setCorrections((p) => ({ ...p, [idx]: { ...result.identified } }));
+    setFeedbackState((p) => ({ ...p, [idx]: 'correcting' }));
+  };
+
+  const handleSubmitCorrection = (idx: number, result: ScanResult) => {
+    const corrected = { ...result.identified, ...corrections[idx] } as IdentifiedProduct;
+    sendFeedback(idx, result.identified, corrected, false);
+  };
+
+  const updateCorrection = (idx: number, field: keyof IdentifiedProduct, value: string | null) => {
+    setCorrections((p) => ({ ...p, [idx]: { ...p[idx], [field]: value } }));
+  };
+
+  // ── Styles ────────────────────────────────────────────────────────────────
 
   const confidenceColor = (c: number) =>
     c > 0.7
@@ -132,18 +197,19 @@ export function LensScanner({ onProductFound, onNoMatch }: LensScannerProps) {
       ? 'bg-amber-100 text-amber-700 dark:bg-amber-500/20 dark:text-amber-400'
       : 'bg-red-100 text-red-700 dark:bg-red-500/20 dark:text-red-400';
 
+  // ── Render ────────────────────────────────────────────────────────────────
+
   return (
     <div className="space-y-4">
+
       {/* Viewfinder */}
       <div className="relative rounded-3xl overflow-hidden bg-slate-950 aspect-[4/3] shadow-2xl">
-        {/* Flash overlay */}
         {flash && <div className="absolute inset-0 bg-white z-50 pointer-events-none" />}
 
-        {capturedImage ? (
-          <img src={capturedImage} className="w-full h-full object-cover" alt="Captured frame" />
-        ) : (
-          <video ref={videoRef} className="w-full h-full object-cover" playsInline muted />
-        )}
+        {capturedImage
+          ? <img src={capturedImage} className="w-full h-full object-cover" alt="Captured frame" />
+          : <video ref={videoRef} className="w-full h-full object-cover" playsInline muted />
+        }
 
         {/* Corner guides */}
         {cameraActive && (
@@ -173,7 +239,7 @@ export function LensScanner({ onProductFound, onNoMatch }: LensScannerProps) {
           </div>
         )}
 
-        {/* Inactive state */}
+        {/* Inactive */}
         {!cameraActive && !capturedImage && (
           <div className="absolute inset-0 flex items-center justify-center bg-slate-950/80 backdrop-blur-sm">
             <div className="text-center px-8">
@@ -211,74 +277,197 @@ export function LensScanner({ onProductFound, onNoMatch }: LensScannerProps) {
           onClick={reset}
           className="w-full py-4 rounded-2xl border-2 border-slate-200 dark:border-slate-700 text-[10px] font-black uppercase tracking-[0.2em] text-slate-500 dark:text-slate-400 hover:border-indigo-400 hover:text-indigo-500 active:scale-[0.98] transition-all"
         >
-          Try Again
+          Scan Again
         </button>
       )}
 
-      {/* Results */}
-      {identified && !identifying && (
-        <div className="premium-card p-6 space-y-5 animate-fade-in">
-          {/* AI result header */}
-          <div className="flex items-start justify-between gap-4">
-            <div>
-              <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 mb-1.5">
-                AI Identified
-              </p>
-              <h3 className="text-xl font-black text-slate-900 dark:text-white leading-tight">
-                {[identified.brand, identified.name].filter(Boolean).join(' ') || 'Unknown Product'}
-              </h3>
-              {identified.variant && (
-                <p className="text-sm font-medium text-slate-500 mt-0.5">{identified.variant}</p>
-              )}
-              {identified.category && (
-                <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 mt-1">
-                  {identified.category.replace('_', ' ')}
-                </p>
-              )}
-            </div>
-            <div className={`px-3 py-1.5 rounded-xl text-[10px] font-black uppercase tracking-wider shrink-0 ${confidenceColor(identified.confidence)}`}>
-              {Math.round(identified.confidence * 100)}% match
-            </div>
-          </div>
+      {/* ── Results ── */}
+      {results.length > 0 && !identifying && (
+        <div className="space-y-3 animate-fade-in">
+          <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 px-1">
+            {results.length} product{results.length > 1 ? 's' : ''} detected
+          </p>
 
-          {/* Database matches */}
-          {matches.length > 0 ? (
-            <div className="space-y-2">
-              <p className="text-[10px] font-black uppercase tracking-widest text-slate-400">
-                {matches.length} product{matches.length > 1 ? 's' : ''} found in inventory
-              </p>
-              {matches.map((m) => (
-                <button
-                  key={m.id}
-                  onClick={() => onProductFound(m)}
-                  className="w-full flex items-center gap-4 p-4 rounded-xl bg-slate-50 dark:bg-slate-800/60 hover:bg-indigo-50 dark:hover:bg-indigo-900/20 border border-transparent hover:border-indigo-200 dark:hover:border-indigo-800 transition-all text-left group"
-                >
+          {results.map((r, i) => {
+            const state      = feedbackState[i] ?? 'idle';
+            const correction = corrections[i] ?? {};
+            const merged     = { ...r.identified, ...correction };
+
+            return (
+              <div key={i} className="premium-card p-5 space-y-4">
+
+                {/* ── Product header ── */}
+                <div className="flex items-start justify-between gap-3">
                   <div className="flex-1 min-w-0">
-                    <p className="font-black text-slate-900 dark:text-white text-sm truncate">{m.name}</p>
-                    <p className="text-xs text-slate-400 mt-0.5">{m.sku} · ${parseFloat(m.retailPrice).toFixed(2)}</p>
+                    <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 mb-1">AI Identified</p>
+                    <h3 className="text-base font-black text-slate-900 dark:text-white leading-tight">
+                      {[r.identified.brand, r.identified.name].filter(Boolean).join(' ') || 'Unknown Product'}
+                    </h3>
+                    <div className="flex items-center gap-2 mt-1 flex-wrap">
+                      {r.identified.variant && (
+                        <span className="text-xs font-medium text-slate-500">{r.identified.variant}</span>
+                      )}
+                      {r.identified.category && (
+                        <span className="text-[10px] font-black uppercase tracking-wider text-slate-400">
+                          {r.identified.category.replace('_', ' ')}
+                        </span>
+                      )}
+                      {r.identified.quantity > 1 && (
+                        <span className="px-2 py-0.5 rounded-lg bg-indigo-100 dark:bg-indigo-500/20 text-indigo-700 dark:text-indigo-400 text-[10px] font-black uppercase tracking-wider">
+                          ×{r.identified.quantity} visible
+                        </span>
+                      )}
+                    </div>
                   </div>
-                  <svg className="w-5 h-5 text-slate-300 group-hover:text-indigo-500 group-hover:translate-x-0.5 transition-all shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M13.5 4.5L21 12m0 0l-7.5 7.5M21 12H3" />
-                  </svg>
-                </button>
-              ))}
-            </div>
-          ) : (
-            <div className="p-4 rounded-xl bg-amber-50 dark:bg-amber-900/20 border border-amber-100 dark:border-amber-800/50">
-              <p className="text-[10px] font-black uppercase tracking-wider text-amber-700 dark:text-amber-400 mb-1">
-                Not in inventory
-              </p>
-              <p className="text-sm text-amber-600 dark:text-amber-300 font-medium">
-                This product wasn't found in your database.
-              </p>
-              <button
-                onClick={() => onNoMatch(identified)}
-                className="mt-3 text-[10px] font-black uppercase tracking-widest text-amber-700 dark:text-amber-400 hover:underline"
-              >
-                Register as new product →
-              </button>
-            </div>
-          )}
+                  <div className={`px-2.5 py-1 rounded-lg text-[10px] font-black uppercase tracking-wider shrink-0 ${confidenceColor(r.identified.confidence)}`}>
+                    {Math.round(r.identified.confidence * 100)}%
+                  </div>
+                </div>
+
+                {/* ── Inventory matches ── */}
+                {r.matches.length > 0 ? (
+                  <div className="space-y-2">
+                    <p className="text-[10px] font-black uppercase tracking-widest text-slate-400">
+                      {r.matches.length} in inventory
+                    </p>
+                    {r.matches.map((m) => (
+                      <button
+                        key={m.id}
+                        onClick={() => onProductFound(m)}
+                        className="w-full flex items-center gap-3 p-3 rounded-xl bg-slate-50 dark:bg-slate-800/60 hover:bg-indigo-50 dark:hover:bg-indigo-900/20 border border-transparent hover:border-indigo-200 dark:hover:border-indigo-800 transition-all text-left group"
+                      >
+                        <div className="flex-1 min-w-0">
+                          <p className="font-black text-slate-900 dark:text-white text-sm truncate">{m.name}</p>
+                          <p className="text-xs text-slate-400 mt-0.5">{m.sku} · ${parseFloat(m.retailPrice).toFixed(2)}</p>
+                        </div>
+                        <svg className="w-4 h-4 text-slate-300 group-hover:text-indigo-500 group-hover:translate-x-0.5 transition-all shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M13.5 4.5L21 12m0 0l-7.5 7.5M21 12H3" />
+                        </svg>
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="p-3 rounded-xl bg-amber-50 dark:bg-amber-900/20 border border-amber-100 dark:border-amber-800/50 flex items-center justify-between gap-3">
+                    <p className="text-xs font-bold text-amber-600 dark:text-amber-300">Not in inventory</p>
+                    <button
+                      onClick={() => onNoMatch(r.identified)}
+                      className="text-[10px] font-black uppercase tracking-widest text-amber-700 dark:text-amber-400 hover:underline shrink-0"
+                    >
+                      Register →
+                    </button>
+                  </div>
+                )}
+
+                {/* ── Feedback row ── */}
+                {state === 'idle' && (
+                  <div className="flex gap-2 pt-1 border-t border-slate-100 dark:border-slate-800">
+                    <button
+                      onClick={() => handleConfirm(i, r)}
+                      className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-xl bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 text-[10px] font-black uppercase tracking-wider hover:bg-emerald-100 dark:hover:bg-emerald-500/20 transition-colors"
+                    >
+                      <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
+                      </svg>
+                      Correct
+                    </button>
+                    <button
+                      onClick={() => handleStartCorrect(i, r)}
+                      className="flex-1 flex items-center justify-center gap-1.5 py-2 rounded-xl bg-rose-50 dark:bg-rose-500/10 text-rose-700 dark:text-rose-400 text-[10px] font-black uppercase tracking-wider hover:bg-rose-100 dark:hover:bg-rose-500/20 transition-colors"
+                    >
+                      <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M16.862 4.487l1.687-1.688a1.875 1.875 0 112.652 2.652L6.832 19.82a4.5 4.5 0 01-1.897 1.13l-2.685.8.8-2.685a4.5 4.5 0 011.13-1.897L16.863 4.487z" />
+                      </svg>
+                      Wrong — Fix it
+                    </button>
+                  </div>
+                )}
+
+                {/* ── Confirmed banner ── */}
+                {(state === 'confirmed' || state === 'saved') && (
+                  <div className="flex items-center gap-2 pt-1 border-t border-slate-100 dark:border-slate-800">
+                    <div className="w-5 h-5 rounded-full bg-emerald-500 flex items-center justify-center shrink-0">
+                      <svg className="w-3 h-3 text-white" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+                        <path strokeLinecap="round" strokeLinejoin="round" d="M4.5 12.75l6 6 9-13.5" />
+                      </svg>
+                    </div>
+                    <p className="text-[10px] font-black uppercase tracking-wider text-emerald-600 dark:text-emerald-400">
+                      Confirmed — saved for training
+                    </p>
+                  </div>
+                )}
+
+                {/* ── Correction form ── */}
+                {state === 'correcting' && (
+                  <div className="pt-2 border-t border-slate-100 dark:border-slate-800 space-y-3">
+                    <p className="text-[10px] font-black uppercase tracking-widest text-rose-500">Correct the identification</p>
+
+                    <div className="grid grid-cols-2 gap-2">
+                      <div className="space-y-1">
+                        <label className="text-[9px] font-black uppercase tracking-widest text-slate-400">Brand</label>
+                        <input
+                          type="text"
+                          value={merged.brand ?? ''}
+                          onChange={(e) => updateCorrection(i, 'brand', e.target.value || null)}
+                          placeholder="e.g. Doritos"
+                          className="w-full px-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-sm font-medium text-slate-900 dark:text-white placeholder:text-slate-400 focus:outline-none focus:border-indigo-400"
+                        />
+                      </div>
+                      <div className="space-y-1">
+                        <label className="text-[9px] font-black uppercase tracking-widest text-slate-400">Product Name</label>
+                        <input
+                          type="text"
+                          value={merged.name ?? ''}
+                          onChange={(e) => updateCorrection(i, 'name', e.target.value || null)}
+                          placeholder="e.g. Tortilla Chips"
+                          className="w-full px-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-sm font-medium text-slate-900 dark:text-white placeholder:text-slate-400 focus:outline-none focus:border-indigo-400"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="space-y-1">
+                      <label className="text-[9px] font-black uppercase tracking-widest text-slate-400">Variant / Flavor / Size</label>
+                      <input
+                        type="text"
+                        value={merged.variant ?? ''}
+                        onChange={(e) => updateCorrection(i, 'variant', e.target.value || null)}
+                        placeholder="e.g. Sweet Chili, 9.25oz"
+                        className="w-full px-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-sm font-medium text-slate-900 dark:text-white placeholder:text-slate-400 focus:outline-none focus:border-indigo-400"
+                      />
+                    </div>
+
+                    <div className="space-y-1">
+                      <label className="text-[9px] font-black uppercase tracking-widest text-slate-400">Category</label>
+                      <select
+                        value={merged.category ?? ''}
+                        onChange={(e) => updateCorrection(i, 'category', e.target.value || null)}
+                        className="w-full px-3 py-2 rounded-xl bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700 text-sm font-medium text-slate-900 dark:text-white focus:outline-none focus:border-indigo-400"
+                      >
+                        <option value="">— select —</option>
+                        {CATEGORIES.map((c) => (
+                          <option key={c} value={c}>{c.replace('_', ' ')}</option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => setFeedbackState((p) => ({ ...p, [i]: 'idle' }))}
+                        className="flex-1 py-2.5 rounded-xl border-2 border-slate-200 dark:border-slate-700 text-[10px] font-black uppercase tracking-wider text-slate-500 hover:border-slate-300 transition-colors"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        onClick={() => handleSubmitCorrection(i, r)}
+                        className="flex-2 flex-1 py-2.5 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white text-[10px] font-black uppercase tracking-wider transition-colors"
+                      >
+                        Submit Correction
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
       )}
 

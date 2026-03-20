@@ -97,10 +97,12 @@ router.get('/:id', authenticate, async (req: Request, res: Response, next) => {
   }
 });
 
-// Get product by barcode
+// Get product by barcode — checks local DB first, falls back to external barcode lookup API
 router.get('/barcode/:code', authenticate, async (req: Request, res: Response, next) => {
   try {
     const { code } = req.params;
+
+    // 1. Check local database first
     const product = await prisma.product.findUnique({
       where: { barcode: code },
       include: {
@@ -113,11 +115,45 @@ router.get('/barcode/:code', authenticate, async (req: Request, res: Response, n
       },
     });
 
-    if (!product) {
-      throw new AppError('Product not found', 404);
+    if (product) {
+      return res.json(product);
     }
 
-    res.json(product);
+    // 2. Not in DB — try external barcode lookup API
+    const apiKey = process.env.BARCODE_LOOKUP_API_KEY;
+    if (apiKey) {
+      try {
+        const lookupRes = await fetch(
+          `https://api.barcodelookup.com/v3/products?barcode=${encodeURIComponent(code)}&formatted=y&key=${apiKey}`
+        );
+
+        if (lookupRes.ok) {
+          const data = await lookupRes.json() as { products?: any[] };
+          const p = data.products?.[0];
+
+          if (p) {
+            // Return external result pre-formatted for the client — not yet in DB
+            return res.status(200).json({
+              isExternalResult: true,
+              barcode: code,
+              name: p.title || p.product_name || null,
+              brand: p.brand || null,
+              description: p.description || null,
+              category: p.category || null,
+              imageUrl: p.images?.[0] || null,
+              retailPrice: null,
+              costPrice: null,
+              sku: null,
+            });
+          }
+        }
+      } catch (lookupError) {
+        console.error('Barcode lookup API error:', lookupError);
+      }
+    }
+
+    // 3. Genuinely unknown barcode
+    throw new AppError('Product not found', 404);
   } catch (error) {
     next(error);
   }
