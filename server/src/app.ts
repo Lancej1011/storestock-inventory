@@ -21,6 +21,8 @@ import visionRoutes from './routes/vision.js';
 import embeddingsRoutes from './routes/embeddings.js';
 import aislesRoutes from './routes/aisles.js';
 import scanRoutes from './routes/scan.js';
+import bundleRoutes from './routes/bundles.js';
+import importRoutes from './routes/import.js';
 import { errorHandler } from './middleware/errorHandler.js';
 import { logger } from './utils/logger.js';
 
@@ -79,6 +81,8 @@ app.use('/api/vision', visionRoutes);
 app.use('/api/embeddings', embeddingsRoutes);
 app.use('/api/aisles', aislesRoutes);
 app.use('/api/scan', scanRoutes);
+app.use('/api/bundles', bundleRoutes);
+app.use('/api/import', importRoutes);
 
 // Error handling
 app.use(errorHandler);

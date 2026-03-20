@@ -4,6 +4,7 @@ import { PrismaClient } from '@prisma/client';
 import { authenticate, authorize } from '../middleware/auth.js';
 import { AppError } from '../middleware/errorHandler.js';
 import { enrichBarcode } from '../services/barcodeEnrichment.js';
+import { trigramSimilarity } from '../utils/similarity.js';
 
 const router = Router();
 const prisma = new PrismaClient();
@@ -72,6 +73,50 @@ router.get('/', authenticate, async (req: Request, res: Response, next) => {
   }
 });
 
+// Similarity search — find existing products with a similar name
+// IMPORTANT: must be registered before /:id so "similar" isn't treated as an ID
+router.get('/similar', authenticate, async (req: Request, res: Response, next) => {
+  try {
+    const name = ((req.query.name as string) || '').trim();
+    if (!name) return res.json([]);
+
+    const threshold = parseFloat((req.query.threshold as string) || '0.5');
+    const exclude = req.query.exclude as string | undefined;
+
+    // Broad candidate fetch: products sharing at least one significant word
+    const words = name.split(/\s+/).filter((w) => w.length > 2);
+    const where: Record<string, unknown> = {
+      isActive: true,
+      OR: words.length
+        ? words.map((word) => ({ name: { contains: word, mode: 'insensitive' } }))
+        : [{ name: { contains: name, mode: 'insensitive' } }],
+    };
+    if (exclude) where.id = { not: exclude };
+
+    const candidates = await prisma.product.findMany({
+      where,
+      select: {
+        id: true,
+        name: true,
+        sku: true,
+        barcode: true,
+        images: { where: { isPrimary: true } },
+      },
+      take: 50,
+    });
+
+    const results = candidates
+      .map((p) => ({ ...p, similarity: trigramSimilarity(name, p.name) }))
+      .filter((p) => p.similarity >= threshold)
+      .sort((a, b) => b.similarity - a.similarity)
+      .slice(0, 5);
+
+    res.json(results);
+  } catch (error) {
+    next(error);
+  }
+});
+
 // Get product by ID
 router.get('/:id', authenticate, async (req: Request, res: Response, next) => {
   try {
@@ -110,6 +155,16 @@ router.get('/barcode/:code', authenticate, async (req: Request, res: Response, n
       images: { where: { isPrimary: true } },
       inventory: {
         include: { store: true, location: true },
+      },
+      bundleParent: {
+        include: {
+          child: {
+            include: {
+              images: { where: { isPrimary: true } },
+              inventory: { include: { store: true, location: true } },
+            },
+          },
+        },
       },
     };
 

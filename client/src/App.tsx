@@ -5,6 +5,7 @@ import Dashboard from './pages/Dashboard';
 import Products from './pages/Products';
 import Inventory from './pages/Inventory';
 import Scan from './pages/Scan';
+import Import from './pages/Import';
 import Layout from './components/Layout';
 
 function PrivateRoute({ children }: { children: React.ReactNode }) {
@@ -28,6 +29,7 @@ function App() {
         <Route path="products" element={<Products />} />
         <Route path="inventory" element={<Inventory />} />
         <Route path="scan" element={<Scan />} />
+        <Route path="import" element={<Import />} />
       </Route>
     </Routes>
   );

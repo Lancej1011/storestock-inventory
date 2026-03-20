@@ -155,6 +155,8 @@ model Product {
   inventory           Inventory[]
   stockTransactions   StockTransaction[]
   purchaseOrderItems  PurchaseOrderItem[]
+  bundleParent        ProductBundle[]     @relation("BundleParent")
+  bundleChild         ProductBundle[]     @relation("BundleChild")
 
   @@index([barcode])
   @@index([sku])
@@ -321,6 +323,19 @@ model ScanFeedback {
   @@index([productId])
   @@index([createdAt])
   @@map("scan_feedback")
+}
+
+model ProductBundle {
+  id              String   @id @default(uuid())
+  parentProductId String   @map("parent_product_id")
+  parent          Product  @relation("BundleParent", fields: [parentProductId], references: [id])
+  childProductId  String   @map("child_product_id")
+  child           Product  @relation("BundleChild", fields: [childProductId], references: [id])
+  quantity        Int      // number of child units contained in one parent/case
+  createdAt       DateTime @default(now()) @map("created_at")
+
+  @@unique([parentProductId, childProductId])
+  @@map("product_bundles")
 }
 
 model AisleLayout {
