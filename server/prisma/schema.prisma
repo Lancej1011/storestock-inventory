@@ -134,6 +134,7 @@ model Product {
   sku           String    @unique
   name          String
   description   String?
+  size          String?   @map("size")
   categoryId    String?   @map("category_id")
   category      Category? @relation(fields: [categoryId], references: [id])
   supplierId    String?   @map("supplier_id")

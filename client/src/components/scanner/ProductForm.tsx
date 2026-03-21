@@ -7,6 +7,7 @@ interface ProductFormProps {
     costPrice: string;
     retailPrice: string;
     description: string;
+    size: string;
   };
   onChange: (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => void;
   onSubmit: () => void;
@@ -14,20 +15,20 @@ interface ProductFormProps {
   loading: boolean;
 }
 
-export const ProductForm: React.FC<ProductFormProps> = ({ 
-  formData, 
-  onChange, 
-  onSubmit, 
-  onCancel, 
-  loading 
+export const ProductForm: React.FC<ProductFormProps> = ({
+  formData,
+  onChange,
+  onSubmit,
+  onCancel,
+  loading
 }) => {
   return (
     <div className="premium-card p-6 animate-fade-in-up border-l-4 border-orange-500">
       <div className="mb-6">
-        <h2 className="text-xl font-black text-slate-900 font-heading tracking-tight">Register New Product</h2>
+        <h2 className="text-xl font-black text-slate-900 dark:text-white font-heading tracking-tight">Register New Product</h2>
         <p className="text-xs text-slate-400 font-medium tracking-tight">Item not found in database. Please initialize catalog entry.</p>
       </div>
-      
+
       <div className="space-y-4">
         <div>
           <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1.5 block">Product Name</label>
@@ -37,7 +38,7 @@ export const ProductForm: React.FC<ProductFormProps> = ({
             value={formData.name}
             onChange={onChange}
             className="input-premium w-full"
-            placeholder="e.g. Premium Leather Goods"
+            placeholder="e.g. Doritos Nacho Cheese"
           />
         </div>
         <div>
@@ -82,6 +83,17 @@ export const ProductForm: React.FC<ProductFormProps> = ({
           </div>
         </div>
         <div>
+          <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1.5 block">Size / Weight</label>
+          <input
+            type="text"
+            name="size"
+            value={formData.size}
+            onChange={onChange}
+            className="input-premium w-full"
+            placeholder="e.g. 9.25oz, 500ml, 1kg"
+          />
+        </div>
+        <div>
           <label className="text-[10px] font-black text-slate-400 uppercase tracking-widest mb-1.5 block">Description</label>
           <textarea
             name="description"
@@ -92,7 +104,7 @@ export const ProductForm: React.FC<ProductFormProps> = ({
           />
         </div>
       </div>
-      
+
       <div className="flex gap-3 mt-8">
         <button
           onClick={onSubmit}
@@ -103,7 +115,7 @@ export const ProductForm: React.FC<ProductFormProps> = ({
         </button>
         <button
           onClick={onCancel}
-          className="px-6 border border-slate-200 text-[10px] font-black text-slate-400 uppercase tracking-widest rounded-xl hover:bg-slate-50 transition-colors"
+          className="px-6 border border-slate-200 dark:border-slate-700 text-[10px] font-black text-slate-400 dark:text-slate-500 uppercase tracking-widest rounded-xl hover:bg-slate-50 dark:hover:bg-slate-800 transition-colors"
         >
           DISCARD
         </button>

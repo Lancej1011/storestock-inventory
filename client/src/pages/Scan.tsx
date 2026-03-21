@@ -96,7 +96,7 @@ export default function Scan() {
   const [stockInSuccess, setStockInSuccess] = useState(false);
   const [showAddProduct, setShowAddProduct] = useState(false);
   const [newProduct, setNewProduct] = useState({
-    name: '', sku: '', costPrice: '', retailPrice: '', description: '',
+    name: '', sku: '', costPrice: '', retailPrice: '', description: '', size: '',
   });
   const [bundle, setBundle] = useState<ProductBundle | null>(null);
   const [duplicateCandidates, setDuplicateCandidates] = useState<DuplicateCandidate[]>([]);
@@ -203,7 +203,7 @@ export default function Scan() {
     setShowAddProduct(false);
     setError(null);
     setAutoPopulated(null);
-    setNewProduct({ name: '', sku: '', costPrice: '', retailPrice: '', description: '' });
+    setNewProduct({ name: '', sku: '', costPrice: '', retailPrice: '', description: '', size: '' });
     setQuantity(1);
     setSelectedLocationId('');
     setScannedItems([]);
@@ -238,7 +238,12 @@ export default function Scan() {
     const prefill = [identified.brand, identified.name, identified.variant]
       .filter(Boolean)
       .join(' ');
-    setNewProduct((prev) => ({ ...prev, name: prefill }));
+    setNewProduct((prev) => ({
+      ...prev,
+      name: prefill,
+      description: identified.description ?? '',
+      size: identified.size ?? '',
+    }));
     setResult('NEW-' + Date.now());
     setShowAddProduct(true);
   };
@@ -463,6 +468,7 @@ export default function Scan() {
         ...newProduct,
         costPrice: parseFloat(newProduct.costPrice),
         retailPrice: parseFloat(newProduct.retailPrice),
+        size: newProduct.size || undefined,
       });
       setProduct(response.data);
       setResult(barcode);

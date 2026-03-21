@@ -14,6 +14,8 @@ type IdentifiedProduct = {
   brand: string | null;
   name: string | null;
   variant: string | null;
+  description: string | null;
+  size: string | null;
   category: string | null;
   confidence: number;
   quantity: number;
@@ -127,24 +129,28 @@ router.post('/identify', authenticate, async (req: AuthRequest, res: Response, n
       aisleSection = `\n\nScanning context: ${aisleLabel}. ${catLine} ${recentLine}\nUse this location context to narrow down which specific product variant this is likely to be.`.trimEnd();
     }
 
-    const prompt = `You are a retail product identification assistant. Analyze this image and identify the primary product visible.${aisleSection}${ocrSection}
+    const prompt = `You are a retail product identification assistant. Analyze this image and identify ALL distinct product types visible.${aisleSection}${ocrSection}
 
-Return ONLY a valid JSON object (no markdown, no explanation):
-{
-  "brand": "brand or manufacturer name, or null if unclear",
-  "name": "product name, or null if unclear",
-  "variant": "size, flavor, or variant like '500ml' or 'Original', or null",
-  "category": "one of: beverage, snack, cleaning, personal_care, food, electronics, household, other, or null",
-  "confidence": 0.85,
-  "quantity": 1,
-  "searchTerms": ["keyword1", "keyword2", "keyword3"]
-}
+Return ONLY a valid JSON array (no markdown, no explanation). One object per distinct product type:
+[
+  {
+    "brand": "brand or manufacturer name, or null if unclear",
+    "name": "product name, or null if unclear",
+    "variant": "flavor or variant like 'Original' or 'Sweet Chili', or null",
+    "description": "one sentence describing the product, or null",
+    "size": "weight or size exactly as printed on packaging like '9.25oz', '500ml', '1kg', or null",
+    "category": "one of: beverage, snack, cleaning, personal_care, food, electronics, household, other, or null",
+    "confidence": 0.85,
+    "quantity": 1,
+    "searchTerms": ["keyword1", "keyword2", "keyword3"]
+  }
+]
 
 Rules:
-- Focus on the most prominent / foreground product
-- Set "quantity" to how many units of that product are visible
-- searchTerms should be 2-5 keywords a person would use to find the product in an inventory database
-- If you cannot identify any product, return confidence 0 with null fields
+- Include ALL distinct product types visible in the image, not just the primary one
+- Set "quantity" to how many units of that product type are visible
+- searchTerms: 2-5 keywords a person would use to find the product in an inventory database
+- If you cannot identify any product, return an array with one object with confidence 0 and null fields
 - Pay close attention to variant details (flavor, size, colour) — past corrections show these are commonly confused${feedbackContext}`;
 
     let text: string;
@@ -159,21 +165,25 @@ Rules:
       throw new AppError(`AI service error: ${geminiError?.message || 'Unknown error'}`, 502);
     }
 
-    let identified: IdentifiedProduct;
+    let identifiedList: IdentifiedProduct[];
     try {
       const cleaned = text.replace(/```json\n?|\n?```/g, '').trim();
       const parsed  = JSON.parse(cleaned);
-      // Accept both single-object and array responses (array: take first element)
-      identified = Array.isArray(parsed) ? parsed[0] : parsed;
+      identifiedList = Array.isArray(parsed) ? parsed : [parsed];
     } catch {
       console.error('Failed to parse Gemini response:', text);
       throw new AppError('Failed to parse AI response', 500);
     }
 
-    // Search inventory for the identified product
-    const matches = await findInventoryMatches(identified);
+    // Run inventory search for each identified product in parallel
+    const products = await Promise.all(
+      identifiedList.map(async (identified) => ({
+        identified,
+        matches: await findInventoryMatches(identified),
+      }))
+    );
 
-    res.json({ identified, matches });
+    res.json({ products });
   } catch (error) {
     next(error);
   }

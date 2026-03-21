@@ -15,6 +15,8 @@ export interface IdentifiedProduct {
   brand: string | null;
   name: string | null;
   variant: string | null;
+  description: string | null;
+  size: string | null;
   category: string | null;
   confidence: number;
   quantity: number;
@@ -64,8 +66,7 @@ export function LensScanner({ onProductFound, onNoMatch, aisleContext, storeId }
   const [visualHit, setVisualHit]         = useState(false);
   const [capturedImage, setCapturedImage] = useState<string | null>(null);
   const [imageThumb, setImageThumb]       = useState<string | null>(null);
-  const [identified, setIdentified]       = useState<IdentifiedProduct | null>(null);
-  const [matches, setMatches]             = useState<ProductMatch[]>([]);
+  const [results, setResults]             = useState<ScanResult[]>([]);
   const [error, setError]                 = useState<string | null>(null);
   const [flash, setFlash]                 = useState(false);
 
@@ -79,6 +80,10 @@ export function LensScanner({ onProductFound, onNoMatch, aisleContext, storeId }
 
   const videoRef  = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
+
+  // Derived from results — primary (first) product drives the single-product UI path
+  const identified = results[0]?.identified ?? null;
+  const matches    = results[0]?.matches    ?? [];
 
   // ── Camera ────────────────────────────────────────────────────────────────
 
@@ -140,8 +145,7 @@ export function LensScanner({ onProductFound, onNoMatch, aisleContext, storeId }
     setOcrEnhancing(false);
     setOcrUsed(false);
     setVisualHit(false);
-    setIdentified(null);
-    setMatches([]);
+    setResults([]);
     setError(null);
     setFeedbackState('idle');
     setCorrection({});
@@ -156,7 +160,6 @@ export function LensScanner({ onProductFound, onNoMatch, aisleContext, storeId }
     setCapturedImage(dataUrl);
     stopCamera();
 
-    // Generate small thumbnail for feedback storage
     const thumbCanvas = document.createElement('canvas');
     thumbCanvas.width  = 160;
     thumbCanvas.height = 120;
@@ -168,7 +171,7 @@ export function LensScanner({ onProductFound, onNoMatch, aisleContext, storeId }
     const fullBbox: [number, number, number, number] = [0, 0, canvas.width, canvas.height];
 
     try {
-      // ── Step 1: Generate MobileNet embedding + check registry (non-blocking) ──
+      // ── Step 1: Embedding check ──
       let embeddingMatch: { productId: string; confidence: number } | null = null;
       try {
         const embedding = await Promise.race([
@@ -177,68 +180,67 @@ export function LensScanner({ onProductFound, onNoMatch, aisleContext, storeId }
         ]) as VisualEmbedding;
         pendingEmbeddingRef.current = embedding;
         embeddingMatch = findProductByEmbedding(embedding, 0.6);
-      } catch {
-        // Model not loaded yet or took too long — skip embedding check this time
-      }
+      } catch { /* skip */ }
 
-      // ── Step 2: ≥ 90% visual match → skip Gemini entirely ──
+      // ── Step 2: ≥90% visual match → skip Gemini ──
       if (embeddingMatch && embeddingMatch.confidence >= 0.9) {
         try {
           const productRes = await api.get(`/products/${embeddingMatch.productId}`);
           const p: ProductMatch = productRes.data;
-          const fakeIdentified: IdentifiedProduct = {
-            brand: null, name: p.name, variant: null, category: null,
-            confidence: embeddingMatch.confidence, quantity: 1, searchTerms: [],
+          const fakeResult: ScanResult = {
+            identified: {
+              brand: null, name: p.name, variant: null, description: p.description ?? null,
+              size: null, category: null, confidence: embeddingMatch.confidence, quantity: 1, searchTerms: [],
+            },
+            matches: [p],
           };
-          setIdentified(fakeIdentified);
-          setMatches([p]);
+          setResults([fakeResult]);
           setVisualHit(true);
           setIdentifying(false);
           confirmProduct(p);
           return;
-        } catch {
-          // Product fetch failed — fall through to Gemini
-        }
+        } catch { /* fall through to Gemini */ }
       }
 
-      // ── Step 3: Run Gemini + OCR in parallel ──
+      // ── Step 3: Gemini + OCR in parallel ──
       const [geminiResponse, ocrResult] = await Promise.all([
         api.post('/scan/identify', { image: base64, mimeType: 'image/jpeg', aisleContext }),
         analyzeProductLabel(canvas),
       ]);
 
-      let { identified: id, matches: m } = geminiResponse.data;
+      let { products } = geminiResponse.data as { products: ScanResult[] };
 
-      // If a visual suggestion existed (60-89%), inject it as first candidate
-      // so the user sees it highlighted even as Gemini confirms/disagrees
-      if (embeddingMatch && embeddingMatch.confidence >= 0.6 && m.length === 0) {
+      // Inject embedding suggestion (60-89%) into first product's matches if empty
+      if (embeddingMatch && embeddingMatch.confidence >= 0.6 && products.length > 0 && products[0].matches.length === 0) {
         try {
           const suggestedRes = await api.get(`/products/${embeddingMatch.productId}`);
-          m = [suggestedRes.data, ...m];
+          products = [
+            { ...products[0], matches: [suggestedRes.data, ...products[0].matches] },
+            ...products.slice(1),
+          ];
         } catch { /* non-fatal */ }
       }
 
-      // ── Step 4: OCR enhancement if Gemini < 70% confident ──
+      // ── Step 4: OCR enhancement — only for single low-confidence result ──
       const ocrText = ocrResult.rawText.trim();
-      if (id.confidence < 0.7 && ocrText.length > 15) {
+      if (products.length === 1 && products[0].identified.confidence < 0.7 && ocrText.length > 15) {
         setIdentifying(false);
         setOcrEnhancing(true);
         try {
           const refined = await api.post('/scan/identify', {
             image: base64, mimeType: 'image/jpeg', ocrText, aisleContext,
           });
-          id = refined.data.identified;
-          m = refined.data.matches;
+          products = (refined.data as { products: ScanResult[] }).products;
           setOcrUsed(true);
         } catch { /* fall through */ }
         setOcrEnhancing(false);
       }
 
-      setIdentified(id);
-      setMatches(m);
+      setResults(products);
 
-      if (m.length === 1) {
-        confirmProduct(m[0]);
+      // Auto-confirm only for single product with exactly one inventory match
+      if (products.length === 1 && products[0].matches.length === 1) {
+        confirmProduct(products[0].matches[0]);
       }
     } catch {
       setError('Could not identify product. Check your connection and try again.');
@@ -251,8 +253,7 @@ export function LensScanner({ onProductFound, onNoMatch, aisleContext, storeId }
   const reset = () => {
     setCapturedImage(null);
     setImageThumb(null);
-    setIdentified(null);
-    setMatches([]);
+    setResults([]);
     setFeedbackState('idle');
     setCorrection({});
     setError(null);
@@ -456,21 +457,30 @@ export function LensScanner({ onProductFound, onNoMatch, aisleContext, storeId }
               <p className="text-[10px] font-black uppercase tracking-widest text-slate-400">
                 {matches.length} in inventory
               </p>
-              {matches.map((m) => (
-                <button
-                  key={m.id}
-                  onClick={() => confirmProduct(m)}
-                  className="w-full flex items-center gap-3 p-3 rounded-xl bg-slate-50 dark:bg-slate-800/60 hover:bg-indigo-50 dark:hover:bg-indigo-900/20 border border-transparent hover:border-indigo-200 dark:hover:border-indigo-800 transition-all text-left group"
-                >
-                  <div className="flex-1 min-w-0">
-                    <p className="font-black text-slate-900 dark:text-white text-sm truncate">{m.name}</p>
-                    <p className="text-xs text-slate-400 mt-0.5">{m.sku} · ${parseFloat(m.retailPrice).toFixed(2)}</p>
-                  </div>
-                  <svg className="w-4 h-4 text-slate-300 group-hover:text-indigo-500 group-hover:translate-x-0.5 transition-all shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
-                    <path strokeLinecap="round" strokeLinejoin="round" d="M13.5 4.5L21 12m0 0l-7.5 7.5M21 12H3" />
-                  </svg>
-                </button>
-              ))}
+              {matches.map((m) => {
+                const img = m.images.find((i) => i.isPrimary);
+                return (
+                  <button
+                    key={m.id}
+                    onClick={() => confirmProduct(m)}
+                    className="w-full flex items-center gap-3 p-3 rounded-xl bg-slate-50 dark:bg-slate-800/60 hover:bg-indigo-50 dark:hover:bg-indigo-900/20 border border-transparent hover:border-indigo-200 dark:hover:border-indigo-800 transition-all text-left group"
+                  >
+                    <div className="w-10 h-10 rounded-xl bg-slate-200 dark:bg-slate-700 shrink-0 overflow-hidden flex items-center justify-center">
+                      {img
+                        ? <img src={img.imageUrl} alt="" className="w-full h-full object-cover" />
+                        : <span className="text-sm font-black text-slate-400">{m.name.charAt(0)}</span>
+                      }
+                    </div>
+                    <div className="flex-1 min-w-0">
+                      <p className="font-black text-slate-900 dark:text-white text-sm truncate">{m.name}</p>
+                      <p className="text-xs text-slate-400 mt-0.5">{m.sku} · ${parseFloat(m.retailPrice).toFixed(2)}</p>
+                    </div>
+                    <svg className="w-4 h-4 text-slate-300 group-hover:text-indigo-500 group-hover:translate-x-0.5 transition-all shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                      <path strokeLinecap="round" strokeLinejoin="round" d="M13.5 4.5L21 12m0 0l-7.5 7.5M21 12H3" />
+                    </svg>
+                  </button>
+                );
+              })}
             </div>
           ) : (
             <div className="p-3 rounded-xl bg-amber-50 dark:bg-amber-900/20 border border-amber-100 dark:border-amber-800/50 flex items-center justify-between gap-3">
@@ -591,6 +601,72 @@ export function LensScanner({ onProductFound, onNoMatch, aisleContext, storeId }
               </div>
             </div>
           )}
+        </div>
+      )}
+
+      {/* ── Additional products detected (multi-product mode) ── */}
+      {results.length > 1 && !identifying && !ocrEnhancing && (
+        <div className="space-y-3 animate-fade-in">
+          <p className="text-[10px] font-black uppercase tracking-widest text-slate-400 px-1">
+            {results.length - 1} more product{results.length - 1 !== 1 ? 's' : ''} detected
+          </p>
+          {results.slice(1).map((r, idx) => (
+            <div key={idx} className="premium-card p-4 space-y-3">
+              <div className="flex items-start justify-between gap-2">
+                <div className="min-w-0">
+                  <p className="font-black text-slate-900 dark:text-white text-sm truncate">
+                    {[r.identified.brand, r.identified.name].filter(Boolean).join(' ') || 'Unknown Product'}
+                  </p>
+                  {(r.identified.variant || r.identified.size) && (
+                    <p className="text-xs text-slate-400 mt-0.5">
+                      {[r.identified.variant, r.identified.size].filter(Boolean).join(' · ')}
+                    </p>
+                  )}
+                </div>
+                <span className={`px-2 py-0.5 rounded-lg text-[10px] font-black uppercase tracking-wider shrink-0 ${confidenceColor(r.identified.confidence)}`}>
+                  {Math.round(r.identified.confidence * 100)}%
+                </span>
+              </div>
+              {r.matches.length > 0 ? (
+                <div className="space-y-1.5">
+                  {r.matches.map((m) => {
+                    const img = m.images.find((i) => i.isPrimary);
+                    return (
+                      <button
+                        key={m.id}
+                        onClick={() => confirmProduct(m)}
+                        className="w-full flex items-center gap-3 p-3 rounded-xl bg-slate-50 dark:bg-slate-800/60 hover:bg-indigo-50 dark:hover:bg-indigo-900/20 border border-transparent hover:border-indigo-200 dark:hover:border-indigo-800 transition-all text-left group"
+                      >
+                        <div className="w-9 h-9 rounded-lg bg-slate-200 dark:bg-slate-700 shrink-0 overflow-hidden flex items-center justify-center">
+                          {img
+                            ? <img src={img.imageUrl} alt="" className="w-full h-full object-cover" />
+                            : <span className="text-xs font-black text-slate-400">{m.name.charAt(0)}</span>
+                          }
+                        </div>
+                        <div className="flex-1 min-w-0">
+                          <p className="font-black text-slate-900 dark:text-white text-sm truncate">{m.name}</p>
+                          <p className="text-xs text-slate-400">{m.sku}</p>
+                        </div>
+                        <svg className="w-4 h-4 text-slate-300 group-hover:text-indigo-500 shrink-0 transition-colors" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2.5}>
+                          <path strokeLinecap="round" strokeLinejoin="round" d="M13.5 4.5L21 12m0 0l-7.5 7.5M21 12H3" />
+                        </svg>
+                      </button>
+                    );
+                  })}
+                </div>
+              ) : (
+                <div className="flex items-center justify-between p-3 rounded-xl bg-amber-50 dark:bg-amber-900/20 border border-amber-100 dark:border-amber-800/50">
+                  <p className="text-xs font-bold text-amber-600 dark:text-amber-300">Not in inventory</p>
+                  <button
+                    onClick={() => onNoMatch(r.identified)}
+                    className="text-[10px] font-black uppercase tracking-widest text-amber-700 dark:text-amber-400 hover:underline"
+                  >
+                    Register →
+                  </button>
+                </div>
+              )}
+            </div>
+          ))}
         </div>
       )}
 
